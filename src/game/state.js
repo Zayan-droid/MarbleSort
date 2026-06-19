@@ -405,6 +405,10 @@ export class GameState {
         m.state = 'dropping';
         m.fromX = L.cx + Math.cos(m.angle) * m.rr;
         m.fromY = L.cy + Math.sin(m.angle) * m.rr;
+        // seed the render position at the detach point THIS frame — otherwise m.x/m.y
+        // still hold the stale entry point (frozen during riding) and the ball flashes
+        // a one-frame ghost on the far side of the loop before the drop tween starts.
+        m.x = m.fromX; m.y = m.fromY;
         m.toX = target.x; m.toY = target.y;
         m.t = 0; m.dur = BIN.dropDurationMs; m.bin = bin; m.slot = slot;
         break;

@@ -19,6 +19,14 @@ const dt = 1 / 60;
 let ok = true;
 const fail = (msg) => { console.error('FAIL:', msg); ok = false; };
 
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy || 1;
+  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
 function channelEscape(state) {
   let worst = 0;
   for (const m of state.marbles) {
@@ -44,17 +52,22 @@ function channelEscape(state) {
     fail(`tap did not dump the whole tray (placed ${state.marbles.length})`);
   }
 
-  let trayPtr = 0, maxTravel = 0, maxEscape = 0;
+  let trayPtr = 0, maxTravel = 0, maxEscape = 0, maxDropOff = 0;
   const entry = new Map();
   for (let f = 0; f < 60 * 300; f++) {
     state.update(dt, omega, false);
     maxEscape = Math.max(maxEscape, channelEscape(state));
     for (const m of state.marbles) {
-      if (m.state !== 'riding') continue;
-      if (!entry.has(m.id)) entry.set(m.id, m.angle);
-      let d = Math.abs(m.angle - entry.get(m.id));
-      d = Math.min(d, Math.PI * 2 - d);
-      maxTravel = Math.max(maxTravel, d);
+      if (m.state === 'riding') {
+        if (!entry.has(m.id)) entry.set(m.id, m.angle);
+        let d = Math.abs(m.angle - entry.get(m.id));
+        d = Math.min(d, Math.PI * 2 - d);
+        maxTravel = Math.max(maxTravel, d);
+      } else if (m.state === 'dropping') {
+        // the rendered position must stay on the detach->bin path; a stale entry
+        // point would put it far off-segment (the one-frame opposite-side ghost)
+        maxDropOff = Math.max(maxDropOff, distToSeg(m.x, m.y, m.fromX, m.fromY, m.toX, m.toY));
+      }
     }
     // when the loop has drained, dump the next non-empty tray
     if (state.marbles.length === 0) {
@@ -65,6 +78,8 @@ function channelEscape(state) {
   }
   console.log('events:', counts);
   console.log('max ride before seating:', maxTravel.toFixed(2), 'rad | max channel escape:', maxEscape.toFixed(2), 'px');
+  console.log('max drop-off render offset (ghost check):', maxDropOff.toFixed(2), 'px');
+  if (maxDropOff > 1) fail(`a dropping ball rendered ${maxDropOff.toFixed(1)}px off its path (opposite-side ghost)`);
   if (counts.drop !== total) fail(`dropped ${counts.drop}/${total}`);
   if (counts.seat !== total) fail(`seated ${counts.seat}/${total}`);
   if (counts.clear === 0) fail('no bin cleared');
