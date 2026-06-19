@@ -1,0 +1,16 @@
+{
+  "name": "whirl",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Whirl — an ASMR marble-sorting game with a spin-dial conveyor",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.1.0",
+    "vite": "^5.4.0"
+  }
+}
