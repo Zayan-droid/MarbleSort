@@ -20,3 +20,6 @@ Thumbs.db
 # local diagnostic screenshots
 mobile_*.png
 ghost*.png
+
+# vercel cli
+.vercel
