@@ -112,7 +112,7 @@ export const SEAT = {
   // to auto-flow — the player isn't spinning AND the flywheel has decayed back to
   // base speed — and has stayed that way for autoFlowDelayMs. While the player
   // spins (or the dial is still coasting), balls just keep riding.
-  autoFlowDelayMs: 1000,  // hold auto-flow this long before drop-offs are allowed
+  autoFlowDelayMs: 250,   // hold auto-flow this long before drop-offs are allowed
   autoFlowEpsilon: 0.12,  // |omega - baseSpeed*dir| under this (and not dragging) = "fully auto flow"
 };
 
