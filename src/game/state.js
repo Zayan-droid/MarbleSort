@@ -17,7 +17,7 @@
 
 import { bus, EV } from '../core/events.js';
 import {
-  LEVELS, ACTIVE_LEVEL, COLORS, LOOP, MARBLE, TRAY, BIN, RULES, DIAL, RADIAL, RELEASE,
+  LEVELS, ACTIVE_LEVEL, COLORS, LOOP, MARBLE, TRAY, BIN, RULES, DIAL, RADIAL, RELEASE, SEAT,
 } from '../config.js';
 
 const TAU = Math.PI * 2;
@@ -41,6 +41,9 @@ export class GameState {
     this._warnCooldown = 0;
     this._time = 0;          // dt-accumulated game clock (ms), for the release gate
     this._lastSpinT = -1e9;  // game time the dial was last "spinning" (far past => start calm)
+    this._autoFlow = false;  // belt currently running on its own (no player influence)?
+    this._autoFlowSince = 0; // game time auto-flow began
+    this.canSeat = false;    // are drop-offs into bins currently allowed?
     this.activity = 0;
     this._lastOmega = 0;
     this.loadLevel(ACTIVE_LEVEL);
@@ -208,10 +211,21 @@ export class GameState {
     const spinning = dragging || Math.abs(omega) > DIAL.baseSpeed * RELEASE.spinThreshold;
     this._placeQueued(spinning);
 
+    // Drop-offs into bins are gated on the belt having FULLY resumed auto-flow
+    // (player not dragging AND speed back to base) and held it for autoFlowDelayMs.
+    const base = DIAL.baseSpeed * DIAL.baseDirection;
+    const autoFlow = !dragging && Math.abs(omega - base) < SEAT.autoFlowEpsilon;
+    if (autoFlow) {
+      if (!this._autoFlow) { this._autoFlow = true; this._autoFlowSince = this._time; }
+    } else {
+      this._autoFlow = false;
+    }
+    this.canSeat = this._autoFlow && (this._time - this._autoFlowSince >= SEAT.autoFlowDelayMs);
+
     this._updateDetents(dt, omega);
     this._advanceMarbles(dt, omega);
     this._resolveJostle(omega);
-    this._detectDropOff();
+    this._detectDropOff(this.canSeat);
     this._resolveBinClears();
 
     // activity (drives ambient swell)
@@ -371,8 +385,9 @@ export class GameState {
   }
 
   // Drop-off: a riding marble aligned with a matching, non-full bin detaches and
-  // falls down into it.
-  _detectDropOff() {
+  // falls down into it. Only runs once the belt is in steady auto-flow (canSeat).
+  _detectDropOff(canSeat) {
+    if (!canSeat) return;
     const L = this.layout;
     const cap = BIN.captureArcDeg * DEG;
     for (const m of this.marbles) {

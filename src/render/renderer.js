@@ -131,7 +131,7 @@ export class Renderer {
     this._drawMarbles(ctx, state);
     this._updateParticles(ctx, dt);
     this._drawVignette(ctx);
-    if (this.debug) this._drawDebug(ctx, beltN, omega);
+    if (this.debug) this._drawDebug(ctx, beltN, omega, state);
   }
 
   _drawLoop(ctx, state, beltN) {
@@ -342,10 +342,10 @@ export class Renderer {
     ctx.fillRect(0, 0, this.w, this.h);
   }
 
-  _drawDebug(ctx, beltN, omega) {
+  _drawDebug(ctx, beltN, omega, state) {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    this._roundRect(ctx, 10, 10, 188, 86, 8);
+    this._roundRect(ctx, 10, 10, 200, 106, 8);
     ctx.fill();
     ctx.fillStyle = '#9fe8b0';
     ctx.font = '600 13px ui-monospace, Menlo, Consolas, monospace';
@@ -353,6 +353,9 @@ export class Renderer {
     ctx.fillText(`FPS      ${this.fps.toFixed(0)}`, 22, 20);
     ctx.fillText(`marbles  ${beltN} / ${RULES.loopCapacity}`, 22, 40);
     ctx.fillText(`ω        ${omega.toFixed(2)} rad/s`, 22, 60);
+    const seat = state && state.canSeat;
+    ctx.fillStyle = seat ? '#9fe8b0' : '#e8855f';
+    ctx.fillText(`seating  ${seat ? 'ON (auto-flow)' : 'OFF (spinning)'}`, 22, 80);
     ctx.restore();
   }
 }

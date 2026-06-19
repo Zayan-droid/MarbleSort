@@ -107,6 +107,15 @@ export const RELEASE = {
   streamAngleGap: 1.15,   // angular spacing between the poured balls (× one ball-diameter / R)
 };
 
+export const SEAT = {
+  // A ball can only drop OFF the belt into a bin once the belt has FULLY returned
+  // to auto-flow — the player isn't spinning AND the flywheel has decayed back to
+  // base speed — and has stayed that way for autoFlowDelayMs. While the player
+  // spins (or the dial is still coasting), balls just keep riding.
+  autoFlowDelayMs: 1000,  // hold auto-flow this long before drop-offs are allowed
+  autoFlowEpsilon: 0.12,  // |omega - baseSpeed*dir| under this (and not dragging) = "fully auto flow"
+};
+
 export const AUDIO = {
   master: 0.85,
   masterLowpassHz: 6500,

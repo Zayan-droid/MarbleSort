@@ -1,7 +1,7 @@
 // Headless smoke test: angular-track model + radial physics + dump-all release.
 import { GameState } from './src/game/state.js';
 import { bus, EV } from './src/core/events.js';
-import { DIAL, BIN, RULES } from './src/config.js';
+import { DIAL, BIN, RULES, SEAT } from './src/config.js';
 
 // Bin-clear hold is a wall-clock timer (correct in-game); neutralize for the fast sim.
 BIN.clearHoldMs = 0;
@@ -106,6 +106,38 @@ function channelEscape(state) {
   console.log(`part2 gate+fling: placed-while-spinning=0 ok | max outward ${flung.toFixed(1)}px of ${room.toFixed(1)}px | escape ${maxEscape.toFixed(2)}px`);
   if (maxRr > 0 && flung < room * 0.5) fail('balls did not fling outward under fast spin');
   if (maxEscape > 0.6) fail(`fast spin ejected a ball by ${maxEscape.toFixed(2)}px`);
+}
+
+// ---- Part 4: drop-off gate (no seating while spinning; only 1s after auto-flow) --
+{
+  const state = new GameState();
+  state.resize(900, 1000);
+  const base = DIAL.baseSpeed * DIAL.baseDirection;
+
+  // place a tray's worth of balls (release gate opens after ~0.5s of calm)
+  state.tapTray(0);
+  for (let f = 0; f < 48; f++) state.update(dt, base, false);
+
+  // Phase A: spin HARD for 2s — balls pass their bin repeatedly but must NOT seat
+  const sA = counts.seat;
+  for (let f = 0; f < 120; f++) state.update(dt, DIAL.maxSpeed, true);
+  const seatsWhileSpinning = counts.seat - sA;
+
+  // Phase B: belt resumes auto-flow — seating must start only after the 1s gate
+  const sB = counts.seat;
+  const tB = state._time;
+  let firstSeatDelay = -1;
+  for (let f = 0; f < 60 * 16; f++) {
+    state.update(dt, base, false);
+    if (firstSeatDelay < 0 && counts.seat > sB) firstSeatDelay = state._time - tB;
+  }
+  const seatsInB = counts.seat - sB;
+  console.log(`part4 gate: seats-while-spinning=${seatsWhileSpinning}, first-seat-after-autoflow=${firstSeatDelay.toFixed(0)}ms (gate ${SEAT.autoFlowDelayMs}ms), seats-in-autoflow=${seatsInB}`);
+  if (seatsWhileSpinning !== 0) fail(`a ball seated while spinning (${seatsWhileSpinning})`);
+  if (seatsInB === 0) fail('no ball seated even after auto-flow resumed');
+  if (firstSeatDelay >= 0 && firstSeatDelay < SEAT.autoFlowDelayMs - 20) {
+    fail(`ball seated ${firstSeatDelay.toFixed(0)}ms after auto-flow (< ${SEAT.autoFlowDelayMs}ms gate)`);
+  }
 }
 
 // ---- Part 3: responsive layout across sizes / aspect ratios ----------------
