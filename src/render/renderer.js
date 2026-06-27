@@ -20,7 +20,7 @@ const SPRITE_COLS = 4, SPRITE_ROWS = 2;
 // spaces/parens and mixed case — glob handles them). Key each URL by the color prefix before
 // the first '_'. The top MONO-COLOR packet tiles draw from CandyTrayPackets/<color> (a tray
 // full of that one color's candies — exactly the Marble-Sort feeder-tile look).
-const PACKET_URLS = import.meta.glob('../../CandyTrayPackets/*.png', { eager: true, query: '?url', import: 'default' });
+const PACKET_URLS = import.meta.glob('../../CandyTrayPAckets/*.png', { eager: true, query: '?url', import: 'default' });
 const TRAY_URLS = import.meta.glob('../../Trays/*.png', { eager: true, query: '?url', import: 'default' });
 
 const TRAY_FRAMES = 4; // tray frame sheets are a horizontal strip: empty | 1 | 2 | 3 candies
