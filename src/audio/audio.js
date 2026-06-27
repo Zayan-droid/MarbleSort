@@ -246,6 +246,43 @@ class AudioEngine {
     p.stop(t + AUDIO.clinkDecay + 0.02);
   }
 
+  // Punchy candy "pop" on release: a short bandpassed noise burst + a quick tonal
+  // blip that drops in pitch. pan in [-1,1] places it around the loop.
+  pop(pan = 0) {
+    if (!this.ready) return;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    const dec = AUDIO.popDecay;
+    const pan2 = ctx.createStereoPanner();
+    pan2.pan.value = clamp(pan, -1, 1);
+    pan2.connect(this.busLowpass);
+
+    // noise burst through a resonant bandpass -> the crisp "tick" of the pop
+    const src = ctx.createBufferSource();
+    src.buffer = this._noise;
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = AUDIO.popHz;
+    bp.Q.value = AUDIO.popQ;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(AUDIO.popGain, t);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + dec);
+    src.connect(bp); bp.connect(ng); ng.connect(pan2);
+    src.start(t); src.stop(t + dec + 0.02);
+
+    // tonal blip for body, pitch dropping fast -> the rounded "boop"
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(AUDIO.popHz * 1.2, t);
+    o.frequency.exponentialRampToValueAtTime(AUDIO.popHz * 0.6, t + dec);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(AUDIO.popGain * 0.6, t);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + dec);
+    o.connect(og); og.connect(pan2);
+    o.start(t); o.stop(t + dec + 0.02);
+  }
+
   // Rounded woody "plunk" when a marble seats.
   seat(pan = 0) {
     if (!this.ready) return;

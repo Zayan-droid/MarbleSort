@@ -36,9 +36,10 @@ class EventBus {
 // Canonical event names (one source of truth; avoids typos across modules).
 export const EV = {
   MARBLE_CLINK: 'marble:clink',   // {x, y, angle, intensity}
-  MARBLE_DROP: 'marble:drop',     // {x, y, color}
-  MARBLE_SEAT: 'marble:seat',     // {x, y, color}
-  BOX_CLEAR: 'box:clear',         // {x, y, color}
+  CANDY_RELEASE: 'candy:release', // {x, y, color, angle}  — one candy left a packet
+  MARBLE_SEAT: 'marble:seat',     // {x, y, color}  — a candy settled into a jar
+  MOVE_INVALID: 'move:invalid',   // {x, y}  — a rejected move (wrong jar / full tray)
+  BOX_CLEAR: 'box:clear',         // {x, y, color}  — a jar completed
   DIAL_DETENT: 'dial:detent',     // {speed}
   DIAL_SPIN: 'dial:spin',         // {speed}  (continuous; emitted each frame)
   JAM_WARNING: 'jam:warning',     // {count}

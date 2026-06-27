@@ -23,3 +23,5 @@ ghost*.png
 
 # vercel cli
 .vercel
+
+.vercel

@@ -1,15 +1,14 @@
-// main.js — bootstrap + main loop. Wires the event bus to audio + haptics so
-// every event's visual, audio, and haptic feedback lands on the SAME frame.
+// main.js — bootstrap + main loop for the packet → center → jars / tray puzzle.
 //
-// The conveyor is the AUTHORITATIVE angular-track model in GameState (no Matter):
-//   dial.update(dt)  ->  state.update(dt, dial.angularVel)  ->  render
-// dial.angularVel (base auto-spin + the player's flick) is the belt speed every
-// riding marble advances by.
+// Wires the event bus to audio + haptics so every event's visual, audio, and haptic feedback
+// lands on the SAME frame. There is no conveyor / dial: the loop is simply
+//   state.update(dt) -> audio.update -> renderer.render
+// (The conveyor GameState + Dial are kept dormant in game/state.js and game/input.js.)
 
 import { bus, EV } from './core/events.js';
-import { DIAL, ACTIVE_LEVEL, LEVELS } from './config.js';
-import { GameState } from './game/state.js';
-import { Dial, setupInput } from './game/input.js';
+import { ACTIVE_LEVEL, LEVELS } from './config.js';
+import { PuzzleGame } from './game/puzzle.js';
+import { setupTapInput } from './game/input.js';
 import { Renderer } from './render/renderer.js';
 import { audio } from './audio/audio.js';
 import { haptics } from './haptics/haptics.js';
@@ -19,8 +18,7 @@ const overlay = document.getElementById('overlay');
 const statusEl = document.getElementById('status');
 const startBtn = document.getElementById('startBtn');
 
-const state = new GameState();
-const dial = new Dial();
+const state = new PuzzleGame();
 const renderer = new Renderer(canvas);
 
 // --- layout / resize ---------------------------------------------------------
@@ -28,7 +26,6 @@ function doResize() {
   const { w, h } = renderer.resize();
   state.resize(w, h);
 }
-// coalesce bursts of resize events (orientation flip, mobile URL bar) to one per frame
 let resizePending = false;
 function scheduleResize() {
   if (resizePending) return;
@@ -43,37 +40,38 @@ if (window.visualViewport) {
 }
 doResize();
 
-// --- input -------------------------------------------------------------------
-setupInput(canvas, dial, {
+// --- input: tap packets / jars / tray ----------------------------------------
+setupTapInput(canvas, {
   getLayout: () => state.layout,
-  onTrayTap: (i) => state.tapTray(i),
+  onPacketTap: (i) => state.onPacketTapped(i),
+  onJarTap: (id) => state.onJarTapped(id),
   onFirstGesture: () => audio.ensureStarted(),
 });
 
 // --- event bus -> sensory channels (same-frame feedback) ---------------------
+bus.on(EV.CANDY_RELEASE, ({ angle }) => {
+  // a candy tumbled out of an opened packet — punchy pop + strong haptic + sparkle (renderer)
+  audio.pop(Math.cos(angle || 0));
+  haptics.release();
+});
 bus.on(EV.MARBLE_CLINK, ({ angle, intensity }) => {
-  audio.clink(Math.cos(angle), intensity);
-});
-bus.on(EV.MARBLE_DROP, ({ angle }) => {
-  // a marble released from a tray — light tap feedback
-  audio.clink(Math.cos(angle), 0.4);
-  haptics.tick();
-});
-bus.on(EV.DIAL_DETENT, ({ speed }) => {
-  audio.clink(0, 0.18 + Math.min(Math.abs(speed) / 10, 0.25)); // soft click
-  haptics.tick();
+  // soft settle as a candy lands in the center / tray
+  audio.clink(Math.cos(angle || 0), intensity);
 });
 bus.on(EV.MARBLE_SEAT, ({ pan }) => {
+  // a candy settled into a jar
   audio.seat(pan || 0);
   haptics.seat();
 });
-bus.on(EV.BOX_CLEAR, () => {
-  audio.clear();
-  haptics.clear();
-});
-bus.on(EV.JAM_WARNING, () => {
+bus.on(EV.MOVE_INVALID, () => {
+  // rejected move (wrong color jar / full tray)
   audio.warning();
   haptics.warning();
+});
+bus.on(EV.BOX_CLEAR, () => {
+  // a jar completed
+  audio.clear();
+  haptics.clear();
 });
 bus.on(EV.GAME_WIN, () => endGame(true));
 bus.on(EV.GAME_LOSE, () => endGame(false));
@@ -90,8 +88,6 @@ function startGame() {
 function restart() {
   state.loadLevel(ACTIVE_LEVEL);
   doResize();
-  dial.angularVel = DIAL.baseSpeed * DIAL.baseDirection;
-  state.beltAngle = 0;
   overlay.classList.add('hidden');
   statusEl.textContent = '';
   running = true;
@@ -100,11 +96,11 @@ function restart() {
 function endGame(won) {
   running = false;
   const def = LEVELS[ACTIVE_LEVEL];
-  statusEl.textContent = won ? '✦ Level Cleared ✦' : 'Loop Jammed';
-  overlay.querySelector('h1').textContent = won ? 'NICE' : 'JAMMED';
+  statusEl.textContent = won ? '✦ Level Cleared ✦' : 'Stuck';
+  overlay.querySelector('h1').textContent = won ? 'NICE' : 'STUCK';
   overlay.querySelector('p').textContent = won
-    ? `You sorted every marble in "${def.name}".`
-    : 'The loop overflowed. Spin faster and sort marbles before they pile up.';
+    ? `You filled every jar in "${def.name}".`
+    : 'No jar can take the candies in the center and the tray is full. Plan which packets you open.';
   startBtn.textContent = 'Play Again';
   overlay.classList.remove('hidden');
 }
@@ -131,18 +127,13 @@ function frame(now) {
   if (dt > 0.05) dt = 0.05; // clamp after tab switches / hitches
 
   if (running) {
-    dial.load = state.beltCount();
-    dial.update(dt);
-    state.update(dt, dial.angularVel, dial.dragging);
-
-    audio.update(dt, dial.angularVel, state.activity);
-    haptics.spinRumble(dial.angularVel);
-    bus.emit(EV.DIAL_SPIN, { speed: dial.angularVel });
+    state.update(dt);
+    audio.update(dt, 0, state.activity); // no belt spin -> speed 0 (beds idle)
   }
 
-  renderer.render(state, dial, dt);
+  renderer.render(state, dt);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-window.WHIRL = { state, dial, audio, haptics, renderer, bus };
+window.CANDYSORT = { state, audio, haptics, renderer, bus };

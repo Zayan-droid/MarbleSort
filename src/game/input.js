@@ -1,10 +1,56 @@
 // input.js — pointer/touch handling.
-//   * Dragging anywhere on the loop spins the dial with 1:1, zero-latency tracking.
-//   * On release the dial coasts (flywheel) and decays toward base speed via friction.
-//   * Load (marble count) makes the dial feel heavier: longer coast, slightly laggier grab.
-//   * Tapping a tray releases its next marble.
+//
+// ACTIVE: setupTapInput() — pure tap routing for the packet puzzle (no dragging). A tap on a
+// top rack candy drops it, a tap on a bottom (active) jar sends matching candies there.
+//
+// DORMANT: the Dial flywheel + setupInput() below belong to the retired conveyor (state.js).
+// They are kept in place but no longer wired up.
 
 import { DIAL } from '../config.js';
+
+// ---- ACTIVE: tap router for the packet → center → jars puzzle -----------
+// `opts` provides geometry + intent callbacks:
+//   opts.getLayout() -> { packets:[{x,y,r}], jars:[{id,x,y,w,h}] }
+//   opts.onPacketTap(index), opts.onJarTap(jarId)
+//   opts.onFirstGesture()
+export function setupTapInput(canvas, opts) {
+  let firstGesture = false;
+
+  function toLocal(ev) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+  }
+
+  function inBox(p, b, margin = 1) {
+    return Math.abs(p.x - b.x) <= b.w / 2 * margin && Math.abs(p.y - b.y) <= b.h / 2 * margin;
+  }
+
+  function onDown(ev) {
+    if (!firstGesture) { firstGesture = true; opts.onFirstGesture && opts.onFirstGesture(); }
+    const p = toLocal(ev);
+    const L = opts.getLayout();
+    if (!L) return;
+
+    // top packets (square tiles), with a small forgiving margin
+    const packets = L.packets || [];
+    for (let i = 0; i < packets.length; i++) {
+      const t = packets[i];
+      const r = t.r * 1.05;
+      if (Math.abs(p.x - t.x) <= r && Math.abs(p.y - t.y) <= r) { opts.onPacketTap(i); return; }
+    }
+    // bottom jar queues — only the ACTIVE (front) jar of each lane is tappable; L.jars holds
+    // those hit-boxes (each carrying its jar id).
+    const jars = L.jars || [];
+    for (let i = 0; i < jars.length; i++) {
+      if (inBox(p, jars[i], 1.04)) { opts.onJarTap(jars[i].id); return; }
+    }
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  // prevent the page from scrolling/zooming under the gesture
+  canvas.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+  canvas.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+}
 
 function wrapAngle(a) {
   while (a > Math.PI) a -= Math.PI * 2;
@@ -62,8 +108,8 @@ export class Dial {
 }
 
 // Wire pointer events. `opts` provides geometry + callbacks.
-//   opts.getLayout() -> { cx, cy, innerR, outerR, trays:[{x,y,r}] }
-//   opts.onTrayTap(index)
+//   opts.getLayout() -> { cx, cy, innerR, outerR, packets:[{x,y,r}] }
+//   opts.onPacketTap(index) -> boolean  (true if a release started)
 //   opts.onFirstGesture()
 export function setupInput(canvas, dial, opts) {
   let dialPointerId = null;
@@ -74,11 +120,14 @@ export function setupInput(canvas, dial, opts) {
     return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
   }
 
-  function trayHit(p) {
+  function packetHit(p) {
     const layout = opts.getLayout();
-    for (let i = 0; i < layout.trays.length; i++) {
-      const t = layout.trays[i];
-      if (Math.hypot(p.x - t.x, p.y - t.y) <= t.r) return i;
+    const packets = layout.packets || [];
+    for (let i = 0; i < packets.length; i++) {
+      const t = packets[i];
+      // square hit-test (tiles are square grid cells), with a small forgiving margin
+      const r = t.r * 1.05;
+      if (Math.abs(p.x - t.x) <= r && Math.abs(p.y - t.y) <= r) return i;
     }
     return -1;
   }
@@ -87,10 +136,10 @@ export function setupInput(canvas, dial, opts) {
     if (!firstGesture) { firstGesture = true; opts.onFirstGesture(); }
     const p = toLocal(ev);
 
-    const ti = trayHit(p);
-    if (ti >= 0) {
-      opts.onTrayTap(ti);
-      return; // a tray tap is not a dial grab
+    const pi = packetHit(p);
+    if (pi >= 0) {
+      opts.onPacketTap(pi); // a single tap streams the whole packet
+      return;               // a packet tap is not a dial grab
     }
 
     if (dialPointerId !== null) return; // already dragging with another finger

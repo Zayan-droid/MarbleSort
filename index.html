@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <title>Whirl</title>
+    <title>Candy Sort</title>
     <style>
       :root {
         color-scheme: dark;
@@ -105,12 +105,13 @@
   </head>
   <body>
     <canvas id="game"></canvas>
-    <div id="hint">drag the dial to spin · tap a tray to drop · press D for debug</div>
+    <div id="hint">tap a packet → fills the center · tap a matching jar · tap the tray to stash / retrieve · D for debug</div>
     <div id="overlay">
-      <h1>WHIRL</h1>
+      <h1>CANDY SORT</h1>
       <p>
-        Spin the dial with your thumb. Drop colored marbles onto the loop and let them ride
-        into their matching boxes. Three of a color clears the box. Don't jam the loop.
+        Tap a packet to tip its candies into the center container. Tap a matching jar to fill it,
+        or park the group in the storage tray on the right when no jar fits — then bring it back
+        later. The center holds one packet; the tray holds three. Fill every jar to win.
       </p>
       <p class="status" id="status"></p>
       <button class="start" id="startBtn">Tap to Play</button>

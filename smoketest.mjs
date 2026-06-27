@@ -1,163 +1,301 @@
-// Headless smoke test: angular-track model + radial physics + dump-all release.
-import { GameState } from './src/game/state.js';
+// Headless smoke test for the candy-rack -> dispenser funnel -> tray -> jars / storage puzzle.
+// Drives the real PuzzleGame (no browser APIs) and asserts: ONE TAP DROPS ONE CANDY (no teleport,
+// the tray pipeline caps at the center capacity), candies tumble + PILE in the tray, then AUTO-
+// ROUTE (matching candies flow into a jar, or park in the storage tray when no jar takes them, and
+// a placeable parked group auto-retrieves), the full win loop, stuck detection, level validation,
+// and responsive layout. Exits non-zero on failure.
+
+import { PuzzleGame } from './src/game/puzzle.js';
+import { validateLevel } from './src/game/levelValidator.js';
 import { bus, EV } from './src/core/events.js';
-import { DIAL, BIN, RULES, SEAT } from './src/config.js';
+import { LEVELS } from './src/config.js';
 
-// Bin-clear hold is a wall-clock timer (correct in-game); neutralize for the fast sim.
-BIN.clearHoldMs = 0;
-
-const counts = { clink: 0, seat: 0, clear: 0, drop: 0, win: 0, lose: 0, warn: 0 };
+const counts = { clink: 0, seat: 0, clear: 0, release: 0, win: 0, lose: 0, invalid: 0 };
+const resetCounts = () => Object.keys(counts).forEach((k) => { counts[k] = 0; });
 bus.on(EV.MARBLE_CLINK, () => counts.clink++);
 bus.on(EV.MARBLE_SEAT, () => counts.seat++);
 bus.on(EV.BOX_CLEAR, () => counts.clear++);
-bus.on(EV.MARBLE_DROP, () => counts.drop++);
+bus.on(EV.CANDY_RELEASE, () => counts.release++);
 bus.on(EV.GAME_WIN, () => counts.win++);
 bus.on(EV.GAME_LOSE, () => counts.lose++);
-bus.on(EV.JAM_WARNING, () => counts.warn++);
+bus.on(EV.MOVE_INVALID, () => counts.invalid++);
 
 const dt = 1 / 60;
 let ok = true;
 const fail = (msg) => { console.error('FAIL:', msg); ok = false; };
 
-function distToSeg(px, py, ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay;
-  const len2 = dx * dx + dy * dy || 1;
-  let t = ((px - ax) * dx + (py - ay) * dy) / len2;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
-}
-
-function channelEscape(state) {
-  let worst = 0;
-  for (const m of state.marbles) {
-    if (m.state !== 'riding') continue;
-    const over = Math.max(0, m.rr - (state.layout.outerR - state.layout.marbleR + 0.5),
-      (state.layout.innerR + state.layout.marbleR - 0.5) - m.rr);
-    worst = Math.max(worst, over);
+// Step update() until the table is QUIESCENT (idle AND auto-routing has nothing left to do) or
+// game over. Auto-routing fires a beat (ANIM.autoRouteDelayMs) AFTER the table goes idle, so we
+// must keep stepping through idle frames — only return once idle has held long enough that no
+// further auto-route move is pending.
+function settle(state, max = 9000) {
+  let stable = 0;
+  for (let i = 0; i < max; i++) {
+    state.update(dt);
+    if (state.phase !== 'playing') return;
+    if (state._idle()) { if (++stable > 40) return; } else stable = 0;
   }
-  return worst;
 }
 
-// ---- Part 1: dump one tray at a time (whole stack) -> ride -> seat -> WIN ----
+// Tap ONE currently-tappable (front-of-column) candy if the tray pipeline has room. Returns true
+// if a candy dropped. The front-first rule means only the candies with nothing in front of them
+// (state.tappableSlots()) can be dispensed.
+function tapFront(state) {
+  if (state.transit.length + state.center.count() >= state.center.capacity) return false;
+  const t = state.tappableSlots();
+  return t.length ? state.onPacketTapped(t[0]) : false;
+}
+
+// SMART play (models a competent player with no storage buffer): drop only a candy whose color an
+// ACTIVE jar can still take, beyond what's already heading there — so the center never fills with
+// candies no jar will accept. Falls back to a plain front tap only when nothing routable is
+// available (a deliberate "wait" move) so the loop can always make progress.
+function activeRoom(state, color) {
+  let room = 0;
+  for (const j of state.jars.activeJars()) if (j.colorKey === color) room += state.jars.roomIn(j);
+  return room;
+}
+function committed(state, color) {
+  let n = 0;
+  for (const c of state.transit) if (c.colorKey === color) n++;
+  for (const c of state.center.candies) if (c.colorKey === color) n++;
+  return n;
+}
+function tapSmart(state) {
+  if (state.transit.length + state.center.count() >= state.center.capacity) return false;
+  for (const i of state.tappableSlots()) {
+    const color = state.packets.slots[i].color;
+    if (activeRoom(state, color) - committed(state, color) > 0) return state.onPacketTapped(i);
+  }
+  return false;
+}
+
+// ---- Part A: ONE tap drops ONE candy; the tray pipeline caps at the center capacity ----
 {
-  const state = new GameState();
+  resetCounts();
+  const state = new PuzzleGame();
   state.resize(900, 1000);
-  const omega = DIAL.baseSpeed; // calm: not "spinning", so queued dumps place
-  const total = state.trays.reduce((n, t) => n + t.stack.length, 0);
 
-  // change-1 contract: tapping dumps the WHOLE stack at once (not one ball)
-  state.tapTray(0);
-  state.update(dt, omega, false);
-  if (state.marbles.length !== state.levelDef.trays[0].length) {
-    fail(`tap did not dump the whole tray (placed ${state.marbles.length})`);
+  const first = state.tappableSlots()[0];
+  if (first === undefined) fail('partA: there should be tappable (front) candies');
+  if (!state.onPacketTapped(first)) fail('partA: a front candy should drop');
+  if (state.center.count() !== 0) fail('partA: candy TELEPORTED into the center on tap');
+  if (state.transit.length !== 1) fail(`partA: one tap should drop exactly 1 candy, got ${state.transit.length}`);
+  if (counts.release !== 1) fail(`partA: expected 1 CANDY_RELEASE, got ${counts.release}`);
+  // a candy still BEHIND another cannot be tapped
+  const blocked = state.packets.slots.findIndex((s, i) => s.color && state._dispenseBlocked(i));
+  if (blocked >= 0 && state.onPacketTapped(blocked) !== false) fail('partA: a candy behind another must not be tappable');
+  // you may rain several down at once — but only up to the holding tray's capacity in flight
+  let dropped = 1;
+  while (tapFront(state)) dropped++;
+  if (dropped !== state.center.capacity) fail(`partA: pipeline should cap at center capacity ${state.center.capacity}, dropped ${dropped}`);
+  if (state.transit.length !== state.center.capacity) fail(`partA: ${state.center.capacity} candies should be in flight, got ${state.transit.length}`);
+
+  // they funnel in over time (a genuine in-flight phase), PILE in the tray (peaking at capacity),
+  // then AUTO-ROUTE drains them into their matching jars.
+  let sawInFlight = false, maxCenter = 0, stable = 0;
+  for (let i = 0; i < 9000; i++) {
+    state.update(dt);
+    if (state.transit.length > 0 && state.center.count() < state.center.capacity) sawInFlight = true;
+    maxCenter = Math.max(maxCenter, state.center.count());
+    if (state.center.count() > state.center.capacity) fail('partA: center exceeded capacity');
+    if (state.phase !== 'playing') break;
+    if (state._idle()) { if (++stable > 40) break; } else stable = 0;
+  }
+  if (!sawInFlight) fail('partA: no in-flight phase — candies appear to teleport');
+  if (maxCenter !== state.center.capacity) fail(`partA: only ${maxCenter}/${state.center.capacity} candies piled in the tray`);
+  if (state._releasing) fail('partA: release lock did not clear after the candies landed');
+  if (state.transit.length !== 0) fail('partA: candies stuck in the dispenser');
+  if (!state.center.isEmpty()) fail(`partA: center should auto-drain, still holds ${state.center.count()}`);
+  if (counts.seat !== state.center.capacity) fail(`partA: ${state.center.capacity} candies should auto-route into jars, seated ${counts.seat}`);
+  console.log('partA dispenser: one tap = one front candy; the pile caps at the tray capacity, then auto-routes');
+}
+
+// ---- Part B: tap front candies one at a time -> auto-sort -> WIN (level 0) ---------
+{
+  resetCounts();
+  const state = new PuzzleGame();
+  state.resize(900, 1000);
+  const totalCandies = state.packets.remainingCandies(); // 32 individual candies
+  const totalJars = state.jars.jars.length;              // 16 (4 lanes × 4 deep)
+
+  // SMART single-tap play (the center is the ONLY buffer now — no storage tray): only drop a candy
+  // an active jar can take, let auto-route drain it, and let completed jars advance their lanes.
+  // Repeat until the rack is empty and every jar is filled.
+  let guard = 0;
+  while (state.phase === 'playing' && guard++ < 800) {
+    let any = false;
+    while (tapSmart(state)) any = true;
+    // if nothing routable is droppable but the table is idle with packets left, make a wait-move
+    if (!any && state._idle() && state.packets.hasRemainingPackets()) any = tapFront(state);
+    settle(state);
+    if (!any && state._idle()) break; // nothing left to do
   }
 
-  let trayPtr = 0, maxTravel = 0, maxEscape = 0, maxDropOff = 0;
-  const entry = new Map();
-  for (let f = 0; f < 60 * 300; f++) {
-    state.update(dt, omega, false);
-    maxEscape = Math.max(maxEscape, channelEscape(state));
-    for (const m of state.marbles) {
-      if (m.state === 'riding') {
-        if (!entry.has(m.id)) entry.set(m.id, m.angle);
-        let d = Math.abs(m.angle - entry.get(m.id));
-        d = Math.min(d, Math.PI * 2 - d);
-        maxTravel = Math.max(maxTravel, d);
-      } else if (m.state === 'dropping') {
-        // the rendered position must stay on the detach->bin path; a stale entry
-        // point would put it far off-segment (the one-frame opposite-side ghost)
-        maxDropOff = Math.max(maxDropOff, distToSeg(m.x, m.y, m.fromX, m.fromY, m.toX, m.toY));
-      }
-    }
-    // when the loop has drained, dump the next non-empty tray
-    if (state.marbles.length === 0) {
-      while (trayPtr < state.trays.length && state.trays[trayPtr].stack.length === 0) trayPtr++;
-      if (trayPtr < state.trays.length) state.tapTray(trayPtr);
-    }
-    if (state.phase !== 'playing') { console.log(`part1 ended f=${f} (${(f * dt).toFixed(1)}s) phase=${state.phase}`); break; }
-  }
   console.log('events:', counts);
-  console.log('max ride before seating:', maxTravel.toFixed(2), 'rad | max channel escape:', maxEscape.toFixed(2), 'px');
-  console.log('max drop-off render offset (ghost check):', maxDropOff.toFixed(2), 'px');
-  if (maxDropOff > 1) fail(`a dropping ball rendered ${maxDropOff.toFixed(1)}px off its path (opposite-side ghost)`);
-  if (counts.drop !== total) fail(`dropped ${counts.drop}/${total}`);
-  if (counts.seat !== total) fail(`seated ${counts.seat}/${total}`);
-  if (counts.clear === 0) fail('no bin cleared');
-  if (maxTravel < 0.8) fail('marbles did not visibly ride');
-  if (counts.win !== 1) fail('did not win');
-  if (maxEscape > 0.6) fail(`a ball left the channel by ${maxEscape.toFixed(2)}px`);
+  if (state.phase !== 'win') fail(`partB did not win (phase=${state.phase})`);
+  if (counts.win !== 1) fail(`win fired ${counts.win} times`);
+  if (counts.lose !== 0) fail('lose fired during a winnable game');
+  if (counts.release !== totalCandies) fail(`released ${counts.release}/${totalCandies}`);
+  if (counts.seat !== totalCandies) fail(`seated ${counts.seat}/${totalCandies}`);
+  if (counts.clear !== totalJars) fail(`cleared ${counts.clear}/${totalJars} jars`);
+  console.log(`partB win: ${totalCandies} candies tapped one-by-one, ${totalJars} jars filled (no storage)`);
 }
 
-// ---- Part 2: spin gate (place only after calm) + centrifugal fling-out ------
+// ---- Part C: one candy per tap drains into its jar; the pipeline caps ----
 {
-  const state = new GameState();
+  resetCounts();
+  const state = new PuzzleGame();
   state.resize(900, 1000);
-  // queue two trays, then SPIN: nothing should place while spinning
-  state.tapTray(0);
-  state.tapTray(1);
-  const omegaFast = DIAL.maxSpeed * 0.8;
-  for (let f = 0; f < 60 * 1.0; f++) state.update(dt, omegaFast, true); // actively spinning
-  if (state.marbles.length !== 0) fail(`balls placed while spinning (${state.marbles.length} on loop)`);
-
-  // stop spinning; balls must NOT place until ~placeDelay of calm has passed.
-  // (placeDelay is wall-clock; here we just confirm they DO place once calm.)
-  let placed = 0;
-  for (let f = 0; f < 60 * 2.0; f++) {
-    state.update(dt, DIAL.baseSpeed, false);
-    placed = Math.max(placed, state.marbles.length + state.bins.reduce((n, b) => n + b.filled, 0));
-  }
-  if (placed === 0) fail('balls never placed after spinning stopped');
-
-  // now spin fast again and confirm centrifugal fling-out, still clamped
-  let maxRr = 0, maxEscape = 0;
-  const L = state.layout;
-  const room = (L.outerR - L.marbleR) - L.R;
-  for (let f = 0; f < 60 * 2; f++) {
-    state.update(dt, omegaFast, true);
-    maxEscape = Math.max(maxEscape, channelEscape(state));
-    for (const m of state.marbles) if (m.state === 'riding') maxRr = Math.max(maxRr, m.rr);
-  }
-  const flung = maxRr - L.R;
-  console.log(`part2 gate+fling: placed-while-spinning=0 ok | max outward ${flung.toFixed(1)}px of ${room.toFixed(1)}px | escape ${maxEscape.toFixed(2)}px`);
-  if (maxRr > 0 && flung < room * 0.5) fail('balls did not fling outward under fast spin');
-  if (maxEscape > 0.6) fail(`fast spin ejected a ball by ${maxEscape.toFixed(2)}px`);
+  const f = state.tappableSlots()[0];
+  const fColor = state.packets.slots[f].color;
+  state.onPacketTapped(f); // one front candy
+  if (state.transit.length !== 1) fail('partC: tapping a candy should drop exactly one');
+  settle(state);
+  const fJar = state.jars.jars.find((j) => j.colorKey === fColor);
+  if (!state.center.isEmpty()) fail(`partC: center should auto-drain after the candy lands, holds ${state.center.count()}`);
+  if (fJar.candies.length !== 1) fail(`partC: the one candy should route to its jar, got ${fJar.candies.length}`);
+  // fill the pipeline to capacity with front candies, then a further tap is rejected (silently)
+  let n = 0;
+  while (tapFront(state)) n++;
+  if (n !== state.center.capacity) fail(`partC: pipeline should cap at ${state.center.capacity}, dropped ${n}`);
+  const more = state.tappableSlots()[0];
+  if (more !== undefined && state.onPacketTapped(more) !== false) fail('partC: a drop beyond the tray pipeline must be rejected');
+  settle(state);
+  console.log('partC: one tap drops one candy that drains to its jar; the tray pipeline caps at capacity');
 }
 
-// ---- Part 4: drop-off gate (no seating while spinning; only 1s after auto-flow) --
+// ---- Part D: the FRONT-FIRST rule — a candy unlocks only once the one in front is dispensed ----
 {
-  const state = new GameState();
+  resetCounts();
+  const state = new PuzzleGame();
   state.resize(900, 1000);
-  const base = DIAL.baseSpeed * DIAL.baseDirection;
-
-  // place a tray's worth of balls (release gate opens after ~0.5s of calm)
-  state.tapTray(0);
-  for (let f = 0; f < 48; f++) state.update(dt, base, false);
-
-  // Phase A: spin HARD for 2s — balls pass their bin repeatedly but must NOT seat
-  const sA = counts.seat;
-  for (let f = 0; f < 120; f++) state.update(dt, DIAL.maxSpeed, true);
-  const seatsWhileSpinning = counts.seat - sA;
-
-  // Phase B: belt resumes auto-flow — seating must start only after the 1s gate
-  const sB = counts.seat;
-  const tB = state._time;
-  let firstSeatDelay = -1;
-  for (let f = 0; f < 60 * 16; f++) {
-    state.update(dt, base, false);
-    if (firstSeatDelay < 0 && counts.seat > sB) firstSeatDelay = state._time - tB;
-  }
-  const seatsInB = counts.seat - sB;
-  console.log(`part4 gate: seats-while-spinning=${seatsWhileSpinning}, first-seat-after-autoflow=${firstSeatDelay.toFixed(0)}ms (gate ${SEAT.autoFlowDelayMs}ms), seats-in-autoflow=${seatsInB}`);
-  if (seatsWhileSpinning !== 0) fail(`a ball seated while spinning (${seatsWhileSpinning})`);
-  if (seatsInB === 0) fail('no ball seated even after auto-flow resumed');
-  if (firstSeatDelay >= 0 && firstSeatDelay < SEAT.autoFlowDelayMs - 20) {
-    fail(`ball seated ${firstSeatDelay.toFixed(0)}ms after auto-flow (< ${SEAT.autoFlowDelayMs}ms gate)`);
-  }
+  // column 0 = slots [0 (back/top), 11 (mid), 22 (front/bottom)] with rackCols = 11.
+  const TOP = 0, MID = 11, FRONT = 22;
+  if (!state._dispenseBlocked(TOP)) fail('partD: a back candy must start blocked');
+  if (!state._dispenseBlocked(MID)) fail('partD: a mid candy must start blocked');
+  if (state._dispenseBlocked(FRONT)) fail('partD: the front (bottom) candy must be tappable');
+  if (state.onPacketTapped(TOP) !== false) fail('partD: tapping a blocked candy must be rejected');
+  if (counts.invalid !== 1) fail('partD: a blocked tap should signal MOVE_INVALID');
+  state.onPacketTapped(FRONT); // dispense the front candy of the column
+  settle(state);
+  if (state._dispenseBlocked(MID)) fail('partD: after the front goes, the next candy must unlock');
+  if (!state._dispenseBlocked(TOP)) fail('partD: the back candy stays blocked until the mid one goes');
+  console.log('partD front-first: a candy unlocks only once the one in front of it is dispensed');
 }
 
-// ---- Part 3: responsive layout across sizes / aspect ratios ----------------
+// ---- Part E: the center is the ONLY buffer — an unroutable color WAITS, then routes ----
 {
-  const state = new GameState();
+  resetCounts();
+  // 5 jars → lanes (index % 4): lane 0 holds jar0 (front) + jar4 (behind). Put RED only at the BACK
+  // of lane 0 so red has NO active jar at the start — a dropped red must WAIT in the center until the
+  // blue in front of it completes and lane 0 advances. Balanced: blue 2, red/green/amber 1 each.
+  const lvl = {
+    name: 'Center Buffer',
+    packets: [{ color: 'blue', count: 2 }, { color: 'green', count: 1 },
+              { color: 'amber', count: 1 }, { color: 'red', count: 1 }],
+    jars: [
+      { id: 'b0', color: 'blue',  capacity: 1 }, // lane 0 FRONT
+      { id: 'g',  color: 'green', capacity: 1 }, // lane 1
+      { id: 'a',  color: 'amber', capacity: 1 }, // lane 2
+      { id: 'b1', color: 'blue',  capacity: 1 }, // lane 3
+      { id: 'r',  color: 'red',   capacity: 1 }, // lane 0 BEHIND b0 — red's only jar, starts a preview
+    ],
+    centerContainer: { capacity: 6 },
+  };
+  LEVELS.push(lvl);
+  const ix = LEVELS.length - 1;
+  const st = new PuzzleGame();
+  st.loadLevel(ix);
+  st.resize(900, 1000);
+  if (st.jars.isActive(st.jars.jarById('r'))) fail('partE: red (behind the blue in its lane) should start as a preview');
+
+  // drop the lone RED first — no active red jar → it must WAIT in the center (not vanish, not lose)
+  const redSlot = st.tappableSlots().find((i) => st.packets.slots[i].color === 'red');
+  st.onPacketTapped(redSlot);
+  settle(st);
+  if (!st.center.colorsPresent().includes('red')) fail('partE: an unroutable red must WAIT in the center (no storage)');
+  if (st.phase !== 'playing') fail(`partE: a candy waiting in the center is not a loss (phase=${st.phase})`);
+
+  // now drop a BLUE → routes into lane 0's front jar b0, which completes → lane 0 advances to red jar r
+  const blueSlot = st.tappableSlots().find((i) => st.packets.slots[i].color === 'blue');
+  st.onPacketTapped(blueSlot);
+  // step long enough for b0 to fill+complete+close (jar close animation) and the lane to advance,
+  // then for the waiting red to auto-route into the now-active jar r.
+  for (let i = 0; i < 2500; i++) { st.update(dt); if (st.jars.jarById('r').candies.length > 0) break; }
+  if (st.jars.jarById('r').candies.length !== 1) fail(`partE: after lane 0 advanced, the waiting red should route into jar r, got ${st.jars.jarById('r').candies.length}`);
+  if (st.center.colorsPresent().includes('red')) fail('partE: the waiting red should have left the center once its jar opened');
+  LEVELS.pop();
+  console.log('partE buffer: an unroutable color waits in the center, then auto-routes when its lane advances');
+}
+
+// ---- Part F: stuck detection without a buffer (center fills with an unplaceable color) ----
+{
+  resetCounts();
+  const dead = {
+    name: 'Dead End',
+    packetSlots: 2,
+    packets: [{ color: 'red', count: 6 }],
+    jars: [{ color: 'blue', capacity: 6 }], // no red jar at all -> red can never be placed
+    centerContainer: { capacity: 6 },
+  };
+  LEVELS.push(dead);
+  const idx = LEVELS.length - 1;
+  const state = new PuzzleGame();
+  state.loadLevel(idx);
+  state.resize(900, 1000);
+  // rain reds into the center until it is full; with no jar + no storage + nothing left to drop, stuck.
+  let ended = false;
+  for (let i = 0; i < 4000; i++) {
+    while (tapFront(state)) { /* fill the center */ }
+    state.update(dt);
+    if (state.phase !== 'playing') { ended = true; break; }
+  }
+  if (!ended || state.phase !== 'lose') fail(`partF: stuck state should LOSE (phase=${state.phase})`);
+  if (counts.lose !== 1) fail('partF: GAME_LOSE should have fired once');
+  LEVELS.pop();
+  console.log('partF stuck: center fills with an unplaceable color and there is no jar/buffer → loss');
+}
+
+// ---- Part G: level validation ----------------------------------------------
+{
+  if (validateLevel(LEVELS[0]) !== true) fail('partG: shipped level 0 should validate');
+  const bad = {
+    name: 'Unbalanced',
+    packets: [{ color: 'red', count: 6 }, { color: 'red', count: 6 }, { color: 'red', count: 6 }],
+    jars: [{ color: 'red', capacity: 6 }], // supply 18 vs demand 6
+    centerContainer: { capacity: 6 },
+  };
+  console.log('partG (expected warnings for the unbalanced level below):');
+  if (validateLevel(bad) !== false) fail('partG: unbalanced level should fail validation');
+  console.log('partG validation: balanced level passes, unbalanced level flagged');
+}
+
+// ---- Part I: jar QUEUE lanes — structure of the shipped 16-jar level (4×4) ----
+// (partB already drives this level to a full win, exercising lane advancement end-to-end.)
+{
+  const state = new PuzzleGame();   // level 0: 16 jars across 4 lanes (4 deep)
+  state.resize(900, 1000);
+  if (state.jars.laneCount !== 4) fail(`partI: expected 4 lanes, got ${state.jars.laneCount}`);
+  if (state.jars.activeJars().length !== 4) fail(`partI: expected 4 active (front) jars, got ${state.jars.activeJars().length}`);
+  for (const a of state.jars.activeJars()) {
+    if (!state.jars.isActive(a)) fail('partI: activeJars() returned a non-front jar');
+  }
+  // up to maxVisible (3) jars show per lane → normally 12 visible at once on this level
+  const maxVis = state.layout.jarQueue.maxVisible;
+  let visible = 0;
+  for (const lane of state.jars.lanes) visible += Math.min(maxVis, lane.length);
+  if (visible !== 12) fail(`partI: expected 12 visible jars (4 lanes × 3), got ${visible}`);
+  // a preview (non-front) jar must reject a direct tap — previews are read-only
+  const preview = state.jars.jars.find((j) => !state.jars.isActive(j));
+  if (!preview) fail('partI: the 16-jar level should have preview jars behind the fronts');
+  else if (state.onJarTapped(preview.id) !== false) fail('partI: a preview jar must not collect candies');
+  console.log('partI queues: 16 jars across 4 lanes, 12 visible, only the 4 fronts active/collectable');
+}
+
+// ---- Part H: responsive layout across sizes / aspect ratios ----------------
+{
+  const state = new PuzzleGame();
   const sizes = [
     [320, 480], [360, 640], [390, 844], [414, 896],
     [640, 360], [844, 390], [896, 414],
@@ -165,23 +303,31 @@ function channelEscape(state) {
     [1280, 800], [1440, 900], [1920, 1080],
     [1080, 1920], [2560, 1080], [3440, 1440],
   ];
+  const tol = 1.0;
   let worst = '';
   for (const [w, h] of sizes) {
     const L = state.resize(w, h);
-    const tol = 1.0;
+    const d = L.dispenser, b = d.box, IR = d.colliders.innerRect, c = L.center;
+    const boxOnScreen = (B) => B.x - B.w / 2 >= -tol && B.x + B.w / 2 <= w + tol
+      && B.y - B.h / 2 >= -tol && B.y + B.h / 2 <= h + tol;
+    const jarsTop = Math.min(...L.jars.map((bb) => bb.y - bb.h / 2));
     const checks = [
-      ['R sane', L.R > 20 && Number.isFinite(L.R)],
-      ['loop in screen X', L.cx - L.outerR >= -tol && L.cx + L.outerR <= w + tol],
-      ['loop in screen Y', L.cy - L.outerR >= -tol && L.cy + L.outerR <= h + tol],
-      ['loop clears tray row', L.cy - L.outerR >= L.trayRowY - tol],
-      ['loop clears bin row', L.cy + L.outerR <= L.binRowY + tol],
-      ['channel has radial room', L.trackW - 2 * L.marbleR > 1],
-      ['trays on screen', L.trays.every((t) => t.x - t.r >= -tol && t.x + t.r <= w + tol && t.y > 0 && t.y < h)],
-      ['bins on screen', L.bins.every((b) => b.x - b.r >= -tol && b.x + b.r <= w + tol && b.y > 0 && b.y < h)],
+      ['dispenser on screen', b.x >= -tol && b.x + b.w <= w + tol && b.y >= -tol && b.y + b.h <= h + tol],
+      ['dispenser at top', b.y <= h * 0.12 + tol],
+      // sized by screen fraction (~85% × ~46%); width may shrink only to stay on screen,
+      // height only to preserve the center+jars tail below the chute.
+      ['dispenser width <= 90%', b.w / w <= 0.90 + 0.001],
+      ['dispenser height <= 50%', b.h / h <= 0.50 + 0.001],
+      ['inner rect within dispenser', IR.left >= b.x - tol && IR.right <= b.x + b.w + tol && IR.top >= b.y - tol && IR.bottom <= b.y + b.h + tol],
+      ['packets within inner rect', L.packets.every((t) => t.x - t.r >= IR.left - tol && t.x + t.r <= IR.right + tol && t.y - t.r >= IR.top - tol && t.y + t.r <= IR.bottom + tol)],
+      ['center finite + on screen', Number.isFinite(c.w) && c.w > 4 && boxOnScreen(c)],
+      ['center below dispenser top', c.y - c.h / 2 >= b.y - tol],
+      ['center above jars', c.y + c.h / 2 <= jarsTop + tol],
+      ['jars on screen', L.jars.every((bb) => boxOnScreen(bb))],
     ];
     for (const [name, pass] of checks) if (!pass) { worst = `${w}x${h}: ${name}`; fail(`layout @ ${w}x${h}: ${name}`); }
   }
-  console.log(`part3 responsive: ${sizes.length} sizes checked` + (worst ? ` (first failure ${worst})` : ' — all valid'));
+  console.log(`partH responsive: ${sizes.length} sizes checked` + (worst ? ` (first failure ${worst})` : ' — all valid'));
 }
 
 console.log(ok ? 'SMOKE TEST OK' : 'SMOKE TEST FAILED');

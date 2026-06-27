@@ -55,6 +55,11 @@ class Haptics {
     this._safeVibrate(HAPTICS.tickMs);
   }
 
+  // Strong single pulse when the player releases a candy (tap or stream).
+  release() {
+    this._safeVibrate(HAPTICS.candyRelease);
+  }
+
   // Firm short thump when a marble seats into a box.
   seat() {
     this._safeVibrate(HAPTICS.seatMs);
