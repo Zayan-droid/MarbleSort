@@ -364,8 +364,8 @@ export const DISPENSER = {
   // is the hero. container.png (1672×941, wide) is drawn to FILL this box, so it stretches to
   // fit; the colliders below are fractions of the box, so they stay aligned to the art either
   // way. (Hitting both targets at once is only possible by not preserving the art's aspect.)
-  widthFrac: 0.85,         // box width as a frac of screen width (target 80–90%)
-  heightFrac: 0.46,        // box height as a frac of screen height (taller hero; clamped on resize
+  widthFrac: 0.96,         // box width as a frac of screen width (wider hero; capped to fit margins)
+  heightFrac: 0.56,        // box height as a frac of screen height (taller hero; clamped on resize
                            // so the center+jars tail below the chute still fits)
   // inner cream rectangle where packet tiles live (frac of the drawn dispenser box). These were
   // MEASURED from container.png's actual cream cavity (not eyeballed) so the colliders line up with

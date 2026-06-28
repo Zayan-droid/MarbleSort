@@ -314,10 +314,10 @@ function tapSmart(state) {
     const checks = [
       ['dispenser on screen', b.x >= -tol && b.x + b.w <= w + tol && b.y >= -tol && b.y + b.h <= h + tol],
       ['dispenser at top', b.y <= h * 0.12 + tol],
-      // sized by screen fraction (~85% × ~46%); width may shrink only to stay on screen,
+      // sized by screen fraction (~96% × ~56%); width may shrink only to stay on screen,
       // height only to preserve the center+jars tail below the chute.
-      ['dispenser width <= 90%', b.w / w <= 0.90 + 0.001],
-      ['dispenser height <= 50%', b.h / h <= 0.50 + 0.001],
+      ['dispenser width <= 96%', b.w / w <= 0.96 + 0.001],
+      ['dispenser height <= 58%', b.h / h <= 0.58 + 0.001],
       ['inner rect within dispenser', IR.left >= b.x - tol && IR.right <= b.x + b.w + tol && IR.top >= b.y - tol && IR.bottom <= b.y + b.h + tol],
       ['packets within inner rect', L.packets.every((t) => t.x - t.r >= IR.left - tol && t.x + t.r <= IR.right + tol && t.y - t.r >= IR.top - tol && t.y + t.r <= IR.bottom + tol)],
       ['center finite + on screen', Number.isFinite(c.w) && c.w > 4 && boxOnScreen(c)],

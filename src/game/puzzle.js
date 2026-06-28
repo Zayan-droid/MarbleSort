@@ -616,7 +616,11 @@ export class PuzzleGame {
     if (!this.center.isEmpty()) {
       const canJar = this.center.colorsPresent().some((col) => this.jars.anyAccepts(col));
       const canProgress = this.packets.hasRemainingPackets() && this.center.hasRoom();
-      if (!canJar && !canProgress) {
+      // A jar that has filled but is still playing its closing animation (complete but not yet
+      // removed) is about to advance its lane and expose a new active jar — which may well accept a
+      // color now waiting in the center. Don't call stuck while such a lane advance is pending.
+      const laneAdvancePending = this.jars.jars.some((j) => j.complete && !j.removed);
+      if (!canJar && !canProgress && !laneAdvancePending) {
         this.phase = 'lose';
         bus.emit(EV.GAME_LOSE, {});
       }
