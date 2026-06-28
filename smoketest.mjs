@@ -8,7 +8,7 @@
 import { PuzzleGame } from './src/game/puzzle.js';
 import { validateLevel } from './src/game/levelValidator.js';
 import { bus, EV } from './src/core/events.js';
-import { LEVELS } from './src/config.js';
+import { LEVELS, DISPENSER } from './src/config.js';
 
 const counts = { clink: 0, seat: 0, clear: 0, release: 0, win: 0, lose: 0, invalid: 0 };
 const resetCounts = () => Object.keys(counts).forEach((k) => { counts[k] = 0; });
@@ -71,11 +71,12 @@ function tapSmart(state) {
 }
 
 // A dedicated ALL-ROUTABLE level for the dispenser/pipeline mechanic tests (partA, partC): its four
-// lane fronts are four DIFFERENT colors, so EVERY front-row candy has an active jar and auto-routes
-// the moment it settles. This keeps partA/partC testing the funnel + pipeline + auto-route mechanic
-// independent of the SHIPPED level 0, which now deliberately leaves some colors unroutable (buffered)
-// — that buffering behaviour is covered by partB/partE/partJ instead. (This is the old Latin-square
-// arrangement of level 0.)
+// lane fronts are four DIFFERENT colors AND each color's active jar is roomy (capacity 8), so EVERY
+// front-row candy has an active jar and a full tray (up to 6) of ANY colour mix auto-routes the
+// moment it settles — regardless of how the rack grid interleaves colours. This keeps partA/partC
+// testing the funnel + pipeline + auto-route mechanic independent of the SHIPPED level 0, which
+// deliberately leaves some colours unroutable (buffered) — that buffering behaviour is covered by
+// partB/partE/partJ instead. (One jar per colour, one per lane, so all four are active at once.)
 const ROUTABLE_LEVEL = {
   name: 'Routable (mechanic test)',
   packetSlots: 6,
@@ -84,14 +85,8 @@ const ROUTABLE_LEVEL = {
     { color: 'blue', count: 8 }, { color: 'green', count: 8 },
   ],
   jars: [
-    { color: 'red',    capacity: 2 }, { color: 'yellow', capacity: 2 },
-    { color: 'blue',   capacity: 2 }, { color: 'green',  capacity: 2 },
-    { color: 'yellow', capacity: 2 }, { color: 'blue',   capacity: 2 },
-    { color: 'green',  capacity: 2 }, { color: 'red',    capacity: 2 },
-    { color: 'blue',   capacity: 2 }, { color: 'green',  capacity: 2 },
-    { color: 'red',    capacity: 2 }, { color: 'yellow', capacity: 2 },
-    { color: 'green',  capacity: 2 }, { color: 'red',    capacity: 2 },
-    { color: 'yellow', capacity: 2 }, { color: 'blue',   capacity: 2 },
+    { color: 'red',    capacity: 8 }, { color: 'yellow', capacity: 8 },
+    { color: 'blue',   capacity: 8 }, { color: 'green',  capacity: 8 },
   ],
   centerContainer: { capacity: 6 },
 };
@@ -199,17 +194,20 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
   resetCounts();
   const state = new PuzzleGame();
   state.resize(900, 1000);
-  // column 0 = slots [0 (back/top), 11 (mid), 22 (front/bottom)] with rackCols = 11.
-  const TOP = 0, MID = 11, FRONT = 22;
-  if (!state._dispenseBlocked(TOP)) fail('partD: a back candy must start blocked');
-  if (!state._dispenseBlocked(MID)) fail('partD: a mid candy must start blocked');
+  // Column 0 is the slots r*cols for r = 0..rows-1 (row 0 = back/top, last row = front/bottom,
+  // toward the chute). Derive them from the LIVE responsive grid (resize() picks 11×3 or 6×6) so
+  // this stays correct whichever grid was chosen for this size.
+  const cols = state._rackCols, rows = state._rackRows;
+  const BACK = 0, FRONT = (rows - 1) * cols, NEXT = (rows - 2) * cols; // NEXT = one behind the front
+  if (!state._dispenseBlocked(BACK)) fail('partD: a back candy must start blocked');
+  if (!state._dispenseBlocked(NEXT)) fail('partD: the candy behind the front must start blocked');
   if (state._dispenseBlocked(FRONT)) fail('partD: the front (bottom) candy must be tappable');
-  if (state.onPacketTapped(TOP) !== false) fail('partD: tapping a blocked candy must be rejected');
+  if (state.onPacketTapped(BACK) !== false) fail('partD: tapping a blocked candy must be rejected');
   if (counts.invalid !== 1) fail('partD: a blocked tap should signal MOVE_INVALID');
   state.onPacketTapped(FRONT); // dispense the front candy of the column
   settle(state);
-  if (state._dispenseBlocked(MID)) fail('partD: after the front goes, the next candy must unlock');
-  if (!state._dispenseBlocked(TOP)) fail('partD: the back candy stays blocked until the mid one goes');
+  if (state._dispenseBlocked(NEXT)) fail('partD: after the front goes, the next candy must unlock');
+  if (rows > 2 && !state._dispenseBlocked(BACK)) fail('partD: the back candy stays blocked until the ones ahead go');
   console.log('partD front-first: a candy unlocks only once the one in front of it is dispensed');
 }
 
@@ -390,12 +388,14 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
     const checks = [
       ['dispenser on screen', b.x >= -tol && b.x + b.w <= w + tol && b.y >= -tol && b.y + b.h <= h + tol],
       ['dispenser at top', b.y <= h * 0.12 + tol],
-      // sized by screen fraction (~96% × ~56%); width may shrink only to stay on screen,
+      // sized by screen fraction (~96% × ~62%); width may shrink only to stay on screen,
       // height only to preserve the center+jars tail below the chute.
       ['dispenser width <= 96%', b.w / w <= 0.96 + 0.001],
-      ['dispenser height <= 58%', b.h / h <= 0.58 + 0.001],
+      ['dispenser height <= 62%', b.h / h <= 0.62 + 0.001],
       ['inner rect within dispenser', IR.left >= b.x - tol && IR.right <= b.x + b.w + tol && IR.top >= b.y - tol && IR.bottom <= b.y + b.h + tol],
-      ['packets within inner rect', L.packets.every((t) => t.x - t.r >= IR.left - tol && t.x + t.r <= IR.right + tol && t.y - t.r >= IR.top - tol && t.y + t.r <= IR.bottom + tol)],
+      // The rack now SPREADS down into the funnel (tapered rows), so candies live within the full
+      // inner-rect WIDTH but extend vertically from IR.top down to ~rackBottomFrac of the box.
+      ['packets within rack region', L.packets.every((t) => t.x - t.r >= IR.left - tol && t.x + t.r <= IR.right + tol && t.y - t.r >= IR.top - tol && t.y + t.r <= b.y + DISPENSER.rackBottomFrac * b.h + tol)],
       ['center finite + on screen', Number.isFinite(c.w) && c.w > 4 && boxOnScreen(c)],
       ['center below dispenser top', c.y - c.h / 2 >= b.y - tol],
       ['center above jars', c.y + c.h / 2 <= jarsTop + tol],

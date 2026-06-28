@@ -8,9 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **packet-management puzzle**:
 
 - **TOP:** a candy-machine DISPENSER (`candyDispenser/candyDispenser.png`) — its inner rectangle is
-  FILLED with a RACK of individual candies (a `DISPENSER.rackCols × rackRows` grid SPANNING the whole
-  inner rect, default 11×3 = 33 cells filled by the level's 32-candy supply; candy size = its cell ×
-  `DISPENSER.rackCandyFill` — fewer rows ⇒ taller cells ⇒ bigger candies).
+  FILLED with a RACK of individual candies (a grid SPANNING the whole inner rect; candy size = its
+  cell × `DISPENSER.rackCandyFill`). The grid is RESPONSIVE: `resize()` picks the `DISPENSER.rackGrids`
+  candidate with the most near-SQUARE cells for the current cavity — tall portrait phones get 6×6 (so
+  candies fill the cavity instead of clustering at the top), wide screens get 11×3. The rack slots are
+  re-dealt (`PacketQueueManager.relayout`) when the chosen cell count changes, preserving the candies
+  still to dispense. Keep every grid's `cols` NOT a multiple of the 4-colour count, or the round-robin
+  rack lines up monochrome columns and the buffer puzzle collapses. `_dispenseBlocked` / the rack
+  layout read the live `this._rackCols`/`this._rackRows`, not the config constants.
   Tapping a candy drops THAT ONE candy, which tumbles (physics) down the diagonal slants and through
   the central chute into the holding tray below; the emptied cell refills from the supply queue.
 - **CENTER:** a holding tray — the main decision space — candies pile on its floor (capacity 6).

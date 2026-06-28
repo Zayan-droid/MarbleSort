@@ -259,6 +259,18 @@ export const RENDER = {
   particleCount: 22,
   particleLifeMs: 620,
   vignette: 0.55,
+  // Seated sprite-candy grounding (center tray + jars): blitted candies are otherwise flat, so a
+  // soft elliptical CONTACT SHADOW is drawn beneath them + a faint TOP GLOSS on top — matching the
+  // shadow/specular the procedural _candy fallback already has. Only SEATED candies use these;
+  // tumbling/transit candies keep the subtler default shadow (and no gloss) so they don't drag a
+  // ground shadow through the air. Tune strength here.
+  candyShadow: {
+    alpha: 0.30,    // contact-shadow opacity (0 = disable the seated contact shadow)
+    scaleX: 0.86,   // shadow half-width  as a multiple of the candy radius r
+    scaleY: 0.30,   // shadow half-height as a multiple of r (flatter ⇒ reads as more grounded)
+    offsetY: 0.86,  // shadow centre below the candy centre (× r) — sits at the candy's base
+  },
+  candyGloss: 0.22, // top specular-highlight opacity on seated sprite candies (0 = disable)
 };
 
 // ---- NEW MECHANIC TUNABLES (packet -> center -> jars) ---------
@@ -283,13 +295,16 @@ export const CENTER = {
   // The cream BASIN interior, MEASURED from the cropped tray art as fractions of the drawn box
   // (left/right = inner walls as frac of WIDTH, floor = inner floor as frac of HEIGHT). The funnel
   // sim continues past the chute into this basin so candies bounce off these walls/floor and pile.
-  basin: { left: 0.04, right: 0.96, floor: 0.75 },
+  basin: { left: 0.104, right: 0.876, floor: 0.719 },
   // candies are considered SETTLED (and handed to the container) once every one is in the basin and
   // moving slower than `speedFracH` of the box height per second for `holdMs`. `maxMs` is only a
   // hang-guard: the natural calm-settle (~4s for a full packet) fires well before it.
   settle: { speedFracH: 0.20, holdMs: 130, maxMs: 6000 },
   // seated / in-transit candy radius as a frac of box HEIGHT — capped to still clear the chute.
-  candyRadiusFracH: 0.095,
+  candyRadiusFracH: 0.15,
+  // TILT: while the tray pours into a jar it TIPS toward that jar (see ANIM.pour). The tray art and
+  // the candies still resting in it rotate together around a pivot near the tray's base. Cosmetic.
+  tilt: { maxRad: 0.17, tauMs: 95, pivotYFrac: 0.62 },
 };
 
 // BOTTOM jars — target containers, one color each, arranged as 4 QUEUE LANES along the bottom
@@ -317,7 +332,8 @@ export const JAR = {
     maxVisible: 3,        // jars shown per lane (front + 2 previews) when that many remain
     minVisible: 3,        // target minimum visible per lane (informational; capped by maxVisible)
     areaWFrac: 0.80,      // bottom area width as a frac of screen width
-    areaHFrac: 0.30,      // bottom area height as a frac of screen height
+    areaHFrac: 0.26,      // bottom area height as a frac of screen height (trimmed from 0.30 to give
+                          // the taller dispenser room above the holding tray)
     bottomMarginFrac: 0.02, // gap below the area as a frac of screen height
     laneGapFrac: 0.03,    // gap between lanes as a frac of the area width
     vGapFrac: 0.03,       // gap between stacked jars as a frac of the area height
@@ -328,9 +344,13 @@ export const JAR = {
   // The clear glass bowl of the open-jar frame where candies (and the target indicator) sit, as
   // fractions of the jar box (cx/cy = center, w/h = size). Re-tune if the jar art changes.
   glass: { cx: 0.5, cy: 0.6, w: 0.64, h: 0.56 },
-  // frames inside Jar/jars.png, as fractions of the 1536×1024 sheet (measured tight bboxes):
+  // frames inside Jar/jars.png, as fractions of the 1536×1024 sheet. The PNG has CLEAN alpha (the
+  // background is fully transparent; the ~42% semi-opaque pixels are the translucent GLASS body, not
+  // a halo), so these are the jars' tight alpha bounding boxes — verified against the alpha channel,
+  // with no neighbouring-jar pixels inside the rect (the open jar ends at x≈206px, its neighbour
+  // only starts at x≈229px). No de-haloing / alpha-trim is needed at load time.
   sheet: {
-    open: { x: 0.0039, y: 0.2021, w: 0.1309, h: 0.2188 }, // empty open jar — the INITIAL look
+    open: { x: 0.0039, y: 0.2012, w: 0.1309, h: 0.2197 }, // empty open jar — the INITIAL look
     lid:  { x: 0.0234, y: 0.0430, w: 0.1367, h: 0.1006 }, // the lid alone — drops on to close
   },
   // closing animation when a jar fills: the lid drops on, holds, then the sealed jar fades away
@@ -350,9 +370,20 @@ export const ANIM = {
   bounce: 0.16,           // settle-bounce amplitude on arrival
   autoRouteDelayMs: 240,  // pause after candies settle in the tray before they auto-flow onward,
                           // so the player SEES them tumble in and rest before they leave
+  // POUR: candies don't glide straight to a jar — the holding tray TIPS toward the target jar and
+  // the matching candies roll over its lip and arc down in (a lip-then-drop quadratic Bézier; see
+  // puzzle.js _pourCandies / candyScreenPos). One jar is poured at a time so the tray tilts a single
+  // direction. Cosmetic + deterministic (driven off _time), so the headless smoketest is unaffected.
+  pour: {
+    durMs: 540,        // travel time tray -> jar (slower than a glide so the pour reads)
+    staggerMs: 95,     // gap between successive candies leaving (a one-by-one pouring stream)
+    lipOutFrac: 0.12,  // how far past the tray lip (frac of tray WIDTH) the arc bulges toward the jar
+    lipLiftFrac: 0.12, // how far the candy rises over the rim (frac of tray HEIGHT) before it drops
+    spinTurns: 1.1,    // tumble (turns) a ROLLING candy makes during the pour; gummies/jelly don't spin
+  },
 };
 
-// ---- CANDY DISPENSER (the container.png packet rack + funnel physics) ----
+// ---- CANDY DISPENSER (the candy_dispenser.png packet rack + funnel physics) ----
 // The PNG is purely visual; these are the invisible colliders + physics tunables. ALL geometry
 // is expressed as FRACTIONS of the dispenser's DRAWN box (origin = box top-left), so it scales to
 // any screen size. Packets sit ONLY inside `innerRect`; tapping one spills its 6 candies, which
@@ -361,31 +392,50 @@ export const ANIM = {
 // these fractions. This is a tiny self-contained sim — NOT a physics engine.
 export const DISPENSER = {
   // The dispenser box is sized DIRECTLY as a fraction of the screen and pinned to the top — it
-  // is the hero. container.png (1672×941, wide) is drawn to FILL this box, so it stretches to
+  // is the hero. candy_dispenser.png (1672×941, wide) is drawn to FILL this box, so it stretches to
   // fit; the colliders below are fractions of the box, so they stay aligned to the art either
   // way. (Hitting both targets at once is only possible by not preserving the art's aspect.)
   widthFrac: 0.96,         // box width as a frac of screen width (wider hero; capped to fit margins)
-  heightFrac: 0.56,        // box height as a frac of screen height (taller hero; clamped on resize
-                           // so the center+jars tail below the chute still fits)
-  // inner cream rectangle where packet tiles live (frac of the drawn dispenser box). These were
-  // MEASURED from container.png's actual cream cavity (not eyeballed) so the colliders line up with
-  // the painted walls — candies bounce on the lines you can see, not invisible ones elsewhere.
-  innerRect: { left: 0.13, right: 0.875, top: 0.275, bottom: 0.61 },
-  // diagonal funnel: the cream narrows from the rectangle's bottom corners to the chute mouth. The
-  // slant line was FIT to the painted pink diagonals (it passes ~(0.585,0.13)→(0.75,0.47)) so candies
-  // ride the visible slant instead of clipping ~0.05 inside it (which read as "going through" it).
-  funnel: { topY: 0.55, botY: 0.715 },
-  // central vertical chute (path) + the exit line where candies leave the dispenser. The painted
-  // chute mouth is narrow (~0.47–0.53) — matching it keeps candies inside the visible funnel. exitY
-  // is the "purple line": candies ride the chute walls all the way down and only release into the
-  // center once they cross it, near the very bottom of the dispenser (measured from the annotation).
-  path: { left: 0.47, right: 0.53, exitY: 0.94 },
+  heightFrac: 0.62,        // box height as a frac of screen height (taller hero; clamped on resize
+                           // so the center+jars tail below the chute still fits — the jar area was
+                           // trimmed to 0.26 of height to give this extra vertical room)
+  // inner rectangle (the open mint/blue cavity) where the candy rack sits (frac of the drawn box).
+  // MEASURED from candy_dispenser.png's actual cavity (per-row alpha bbox, not eyeballed): the cavity
+  // walls hold ~0.125..0.873 from y≈0.15 down to where it starts narrowing (~0.55).
+  innerRect: { left: 0.13, right: 0.87, top: 0.15, bottom: 0.52 },
+  // diagonal funnel: the cavity narrows from the rectangle's bottom corners to the chute mouth. The
+  // slant line was FIT to the measured cavity edges — a straight (0.13,0.55)→(0.462,0.82) on the left
+  // (and mirror on the right) tracks the painted slant within ~0.005 the whole way down.
+  funnel: { topY: 0.55, botY: 0.82 },
+  // central vertical chute (path) + the exit line where candies leave the dispenser. The measured
+  // chute mouth is ~0.462..0.534 (centre ≈0.498) — matching it keeps candies inside the visible spout.
+  // exitY: candies ride the chute walls down into the spout and only release into the center once they
+  // cross it, near the very bottom of the dispenser (the spout art runs to ~0.965).
+  path: { left: 0.462, right: 0.534, exitY: 0.94 },
   // CANDY RACK grid inside the inner rectangle: the dispenser is FILLED with individual candies
   // (rackCols × rackRows of them, SPANNING the whole inner rect) and ONE TAP drops ONE candy.
-  // Fewer ROWS → taller cells → BIGGER candies. 11×3 = 33 cells; a 32-candy supply fills all but
-  // the last (so 32 big candies cover the dispenser, near-square cells).
-  rackCols: 11, rackRows: 3,
-  rackCandyFill: 0.98,     // candy diameter as a frac of its (inscribed) cell — big, near-touching
+  // RESPONSIVE: resize() picks whichever grid in `rackGrids` makes the BIGGEST candies for the
+  // current cavity aspect, so a tall PORTRAIT phone uses the squarer 6×6 (candies fill all the way
+  // down instead of clustering small at the top) while a WIDE screen uses 11×3 (a wide row of bigger
+  // candies, not a sparse 6-wide bar). rackCols/rackRows below are the default/fallback (used before
+  // the first resize, and by any code that reads the constants).
+  // NB: every grid's cols must NOT be a multiple of the colour count (4) — otherwise the round-robin
+  // rack lines each column up as a single colour, every colour is always tappable, and the
+  // center-buffer puzzle collapses (no waiting, no stuck). 11 and 6 are both fine. (Both grids are
+  // verified puzzle-preserving by smoketest partB/partJ.) Fewer ROWS → taller cells → BIGGER candies.
+  rackCols: 6, rackRows: 6,
+  rackGrids: [{ cols: 11, rows: 3 }, { cols: 6, rows: 6 }],
+  // The candy rack SPREADS down to `rackBottomFrac` of the box (not just the rectangular cavity), so
+  // the lower rows reach into the FUNNEL and the candies fill the dispenser instead of clustering at
+  // the top. Rows below the funnel mouth TAPER: each row is positioned + sized to the cavity width at
+  // its height (it narrows toward the chute), so candies always stay inside the visible glass. Keep
+  // this above the chute walls so the bottom row doesn't shrink to nothing (~0.70 ends just above the
+  // funnel's narrow throat).
+  rackBottomFrac: 0.70,
+  rackCandyFill: 0.7,      // candy diameter as a frac of its (inscribed) cell — leaves clear space on
+                           // all 4 sides of each untouched rack candy (≥30% gap of the pitch at every
+                           // screen size; the candy is sized from the SMALLER cell dim so both axes have
+                           // margin, and it scales with the cell so the spacing is screen-independent)
   packetGapFrac: 0.02,     // (legacy)
   packetPadFrac: 0.015,    // small padding inside the inner rectangle before the grid spans it
   packetMaxCols: 3,        // (legacy; the rack uses rackCols/rackRows)

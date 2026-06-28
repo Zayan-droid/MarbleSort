@@ -9,7 +9,7 @@
 import { bus, EV } from '../core/events.js';
 import { COLORS, THEME, RENDER, RULES, BIN, DIAL, ART, PACKET, CENTER, JAR } from '../config.js';
 import candyUrl from '../../newcandy/newcandies.png';
-import dispenserUrl from '../../candyDispenser/container.png';
+import dispenserUrl from '../../candyDispenser/candy_dispenser.png';
 import jarUrl from '../../Jar/jars.png';
 import bgUrl from '../../background/background.png';
 import holdingTrayUrl from '../../containers/newholdingtray.png';
@@ -411,13 +411,39 @@ export class Renderer {
   }
 
   _candy(ctx, x, y, r, col, opts = {}) {
-    const { scale = 1, roll = null, shape = 'round', angle = 0, squash = null } = opts;
+    const { scale = 1, roll = null, shape = 'round', angle = 0, squash = null, ground = false } = opts;
     r *= scale;
-    // soft contact shadow grounds the candy on the belt / in its slot (stays level, not deformed)
+    const baseA = ctx.globalAlpha; // preserve any fade (e.g. a candy in a closing jar)
+    // soft contact shadow grounds the candy (stays level, not deformed). A SEATED candy
+    // (ground:true) gets a lower/wider, strength-tunable shadow so it reads BENEATH the larger
+    // blitted sprite; everything else keeps the original subtle shadow (transit / indicators /
+    // procedural) so airborne candies don't drag a ground shadow through the air.
+    const sh = RENDER.candyShadow;
     ctx.beginPath();
-    ctx.ellipse(x + r * 0.12, y + r * 0.5, r * 0.82, r * 0.4, 0, 0, Math.PI * 2);
-    ctx.fillStyle = RENDER.marbleShadow;
-    ctx.fill();
+    if (ground && sh && sh.alpha > 0) {
+      ctx.ellipse(x + r * 0.10, y + r * sh.offsetY, r * sh.scaleX, r * sh.scaleY, 0, 0, Math.PI * 2);
+      ctx.globalAlpha = baseA * sh.alpha;
+      ctx.fillStyle = '#000';
+      ctx.fill();
+      ctx.globalAlpha = baseA;
+    } else if (!ground) {
+      ctx.ellipse(x + r * 0.12, y + r * 0.5, r * 0.82, r * 0.4, 0, 0, Math.PI * 2);
+      ctx.fillStyle = RENDER.marbleShadow;
+      ctx.fill();
+    }
+
+    // Faint top specular gloss for SEATED sprite candies — drawn AFTER the blit, in screen space,
+    // so it stays fixed to the light even when the candy rests at an angle (restAngle). No-op when
+    // not grounded, so transit/indicator candies are unchanged.
+    const gloss = () => {
+      if (!ground || !(RENDER.candyGloss > 0)) return;
+      ctx.globalAlpha = baseA * RENDER.candyGloss;
+      ctx.beginPath();
+      ctx.ellipse(x - r * 0.30, y - r * 0.42, r * 0.30, r * 0.20, -0.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+      ctx.globalAlpha = baseA;
+    };
 
     // sprite path: blit the candy's art from the sheet, sized so the body ≈ 2r. A rolling candy
     // rotates the whole sprite; a soft candy (jelly/cake) squashes — flattened along the impact
@@ -429,8 +455,8 @@ export class Renderer {
       if (angle) ctx.rotate(angle);
       const ok = this._blitCandySprite(ctx, col, 0, 0, r * 2 * ART.candyFill);
       ctx.restore();
-      if (ok) return;
-    } else if (this._blitCandySprite(ctx, col, x, y, r * 2 * ART.candyFill)) return;
+      if (ok) { gloss(); return; }
+    } else if (this._blitCandySprite(ctx, col, x, y, r * 2 * ART.candyFill)) { gloss(); return; }
 
     // --- procedural fallback (only until the spritesheet loads) ---
     // body
@@ -1053,20 +1079,25 @@ export class Renderer {
   _drawCenterBox(ctx, state) {
     const b = state.layout.center;
     const x = b.x - b.w / 2, y = b.y - b.h / 2;
+    // while pouring, the tray TIPS toward the target jar — rotate it around a pivot near its base.
+    const tilt = state.centerTiltInfo ? state.centerTiltInfo() : null;
+    ctx.save();
+    if (tilt && tilt.angle) { ctx.translate(tilt.x, tilt.y); ctx.rotate(tilt.angle); ctx.translate(-tilt.x, -tilt.y); }
     if (this.holdingTrayReady) {
       // newholdingtray.png has wide transparent margins — blit only its opaque tray region
       // (CENTER.artCrop) so the open tray fills the box. Candies pile on its floor (no grooves).
       const img = this.holdingTrayImg, iw = img.naturalWidth, ih = img.naturalHeight, C = CENTER.artCrop;
       ctx.drawImage(img, C.x * iw, C.y * ih, C.w * iw, C.h * ih, x, y, b.w, b.h);
-      return;
+    } else {
+      // procedural fallback: a shallow open tray (no wells — candies settle naturally on the floor)
+      const rad = Math.min(b.w, b.h) * 0.14;
+      this._glassBox(ctx, x, y, b.w, b.h, rad, 'rgba(120,140,170,0.20)', 'rgba(60,72,96,0.16)', 'rgba(255,255,255,0.22)');
+      const ip = b.pad * 0.5;
+      this._roundRect(ctx, x + ip, y + ip, b.w - 2 * ip, b.h - 2 * ip, rad * 0.78);
+      ctx.fillStyle = 'rgba(12,16,24,0.30)';
+      ctx.fill();
     }
-    // procedural fallback: a shallow open tray (no wells — candies settle naturally on the floor)
-    const rad = Math.min(b.w, b.h) * 0.14;
-    this._glassBox(ctx, x, y, b.w, b.h, rad, 'rgba(120,140,170,0.20)', 'rgba(60,72,96,0.16)', 'rgba(255,255,255,0.22)');
-    const ip = b.pad * 0.5;
-    this._roundRect(ctx, x + ip, y + ip, b.w - 2 * ip, b.h - 2 * ip, rad * 0.78);
-    ctx.fillStyle = 'rgba(12,16,24,0.30)';
-    ctx.fill();
+    ctx.restore();
   }
 
   // ---- bottom jars ----
@@ -1182,6 +1213,9 @@ export class Renderer {
   // ---- candies (resting then animating, so movers draw on top) ----
   _drawCandies(ctx, state) {
     const all = state._allCandies();
+    // tray-tip transform: candies still RESTING in the holding tray rotate with it as it pours.
+    const tinfo = state.centerTiltInfo ? state.centerTiltInfo() : null;
+    const tilted = tinfo && tinfo.angle;
     const draw = (c) => {
       // candies sealed inside a removed jar are gone; ones in a closing jar fade with it
       if (c.where === 'jar' && c.jar) {
@@ -1191,13 +1225,21 @@ export class Renderer {
           ctx.globalAlpha = close ? close.alpha : 1;
         }
       }
-      const p = state.candyScreenPos(c);
+      let p = state.candyScreenPos(c);
+      let extraAngle = 0;
+      if (tilted && c.where === 'center' && !c.anim) {
+        const s = Math.sin(tinfo.angle), co = Math.cos(tinfo.angle);
+        const dx = p.x - tinfo.x, dy = p.y - tinfo.y;
+        p = { x: tinfo.x + dx * co - dy * s, y: tinfo.y + dx * s + dy * co };
+        extraAngle = tinfo.angle;
+      }
       const r = state.candyRadius(c);
       const col = COLORS[c.colorKey];
       // resting center candies keep the orientation they tumbled to (restAngle) + finish any landing
       // jiggle/squash; jar/tray candies sit upright and undeformed.
       const sq = c.where === 'center' ? this._squashOf(c) : null;
-      if (col) this._candy(ctx, p.x, p.y, r, col, { scale: state.candyPop(c), shape: col.shape, angle: c.restAngle || 0, squash: sq });
+      // seated candies (center tray + jars) are grounded: a soft contact shadow + faint top gloss.
+      if (col) this._candy(ctx, p.x, p.y, r, col, { scale: state.candyPop(c), shape: col.shape, angle: (c.restAngle || 0) + extraAngle, squash: sq, ground: true });
       ctx.globalAlpha = 1;
     };
     for (const c of all) if (!c.anim) draw(c);

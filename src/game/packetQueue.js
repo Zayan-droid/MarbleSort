@@ -34,12 +34,50 @@ export class PacketQueueManager {
 
   slotById(slotId) { return this.slots.find((s) => s.slotId === slotId) || null; }
 
+  // RESPONSIVE re-grid: re-deal the candies still to dispense into a rack of `capacity` slots. Used
+  // when resize() switches the rack grid (e.g. 11×3 ⇄ 6×6) and the cell count changes. Preserves the
+  // remaining candies in order (filled slots first, then the queue), so at game start (nothing
+  // consumed yet) this reproduces the same rack a fresh build of that grid would make. A no-op if the
+  // capacity is unchanged.
+  relayout(capacity) {
+    if (capacity === this.slots.length) return;
+    const remaining = [];
+    for (const s of this.slots) if (s.color) remaining.push(s.color);
+    for (const c of this.queue) remaining.push(c);
+    this.queue = remaining;
+    this.slots = Array.from({ length: capacity }, (_, i) => ({ slotId: i, color: null }));
+    for (const s of this.slots) this._fill(s.slotId);
+  }
+
   // Pull the next queued candy into a slot (null if the queue is empty).
   _fill(slotId) {
     const slot = this.slotById(slotId);
     if (!slot) return null;
     slot.color = this.queue.length ? this.queue.shift() : null;
     return slot.color;
+  }
+
+  // Center the candies in a PARTIAL last row. When the rack has more cells than the supply (e.g. a
+  // 6×6 = 36-cell grid holding 32 candies), the trailing slots are empty, so the last row fills from
+  // the LEFT. Shift its candies into the MIDDLE columns (padding both edges with empty slots) so the
+  // bottom row reads centred. Moves the COLORS (not just x positions), so the front-first rule and
+  // the blocked-candy dimming stay aligned with what's drawn. Only fires when the queue is empty
+  // (a partial row only exists when supply < capacity), so no refill ever lands in a padded edge.
+  centerLastRow(cols) {
+    if (this.queue.length || cols < 1) return;
+    const n = this.slots.length;
+    const rows = Math.ceil(n / cols);
+    if (rows < 1) return;
+    const start = (rows - 1) * cols;
+    const lastRow = this.slots.slice(start);                 // the final row's slots, left→right
+    const colors = lastRow.filter((s) => s.color).map((s) => s.color);
+    if (!colors.length || colors.length >= lastRow.length) return; // empty or already full → nothing to do
+    const offset = Math.floor((lastRow.length - colors.length) / 2);
+    if (offset <= 0) return;
+    for (let c = 0; c < lastRow.length; c++) {
+      const k = c - offset;
+      this.slots[start + c].color = (k >= 0 && k < colors.length) ? colors[k] : null;
+    }
   }
 
   // TAP: drop the SINGLE candy in `slotIndex`. Returns a 1-length array of its color (so callers
