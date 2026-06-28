@@ -451,28 +451,37 @@ export const LEVELS = [
       { id: 'p4', color: 'green',  shape: 'jelly', count: 8 },
     ],
     // 16 jars (cap 2) → distributed round-robin into the 4 queue lanes (lane = index % 4), so each
-    // lane is a 4-deep queue (3 shown + 1 hidden behind). The order is a cyclic Latin square, so the
-    // lanes read as MIXED color queues (front jars = red / yellow / blue / green) yet stay balanced
-    // (4 jars × cap 2 = 8 per color === the per-color supply). Lanes front→back:
-    //   L0 red→yellow→blue→green   L1 yellow→blue→green→red
-    //   L2 blue→green→red→yellow   L3 green→red→yellow→blue
+    // lane is a 4-deep queue (3 shown + 1 hidden behind). Still balanced (4 jars × cap 2 = 8 per
+    // color === the per-color supply) and the lanes still read as MIXED queues, but this is NOT a
+    // Latin square — it is CLUSTERED + STAGGERED so the player must BUFFER and sequence:
+    //   • The four lane FRONTS start as red / red / red / blue — only TWO colors are collectable, so
+    //     GREEN and YELLOW have NO active jar at the start and must WAIT in the center (cap 6) until a
+    //     lane advances. The rack interleaves all four colors and the front-first rule means a green
+    //     or yellow often blocks the candy you want, forcing you to drop it into the center buffer.
+    //   • Because three lanes share red up front, those three lanes advance together and the active
+    //     colors shift in waves — so the unavailable colors rotate and the buffer must be drained at
+    //     the right moment. Careless "tap everything" play fills the center with colors no jar takes
+    //     and gets STUCK (a real loss); sensible greedy + buffering wins (peaks at ~3/6 in the center).
+    // Lanes front→back:
+    //   L0 red → blue → green → yellow      L1 red → blue → yellow → green
+    //   L2 red → yellow → green → blue      L3 blue → red → green → yellow
     jars: [
       { id: 'j1',  color: 'red',    shape: 'gummy', capacity: 2 }, // L0 front
-      { id: 'j2',  color: 'yellow', shape: 'cube',  capacity: 2 }, // L1 front
-      { id: 'j3',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L2 front
-      { id: 'j4',  color: 'green',  shape: 'jelly', capacity: 2 }, // L3 front
-      { id: 'j5',  color: 'yellow', shape: 'cube',  capacity: 2 }, // L0 #2
+      { id: 'j2',  color: 'red',    shape: 'gummy', capacity: 2 }, // L1 front
+      { id: 'j3',  color: 'red',    shape: 'gummy', capacity: 2 }, // L2 front
+      { id: 'j4',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L3 front
+      { id: 'j5',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L0 #2
       { id: 'j6',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L1 #2
-      { id: 'j7',  color: 'green',  shape: 'jelly', capacity: 2 }, // L2 #2
+      { id: 'j7',  color: 'yellow', shape: 'cube',  capacity: 2 }, // L2 #2
       { id: 'j8',  color: 'red',    shape: 'gummy', capacity: 2 }, // L3 #2
-      { id: 'j9',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L0 #3
-      { id: 'j10', color: 'green',  shape: 'jelly', capacity: 2 }, // L1 #3
-      { id: 'j11', color: 'red',    shape: 'gummy', capacity: 2 }, // L2 #3
-      { id: 'j12', color: 'yellow', shape: 'cube',  capacity: 2 }, // L3 #3
-      { id: 'j13', color: 'green',  shape: 'jelly', capacity: 2 }, // L0 back (hidden)
-      { id: 'j14', color: 'red',    shape: 'gummy', capacity: 2 }, // L1 back (hidden)
-      { id: 'j15', color: 'yellow', shape: 'cube',  capacity: 2 }, // L2 back (hidden)
-      { id: 'j16', color: 'blue',   shape: 'bean',  capacity: 2 }, // L3 back (hidden)
+      { id: 'j9',  color: 'green',  shape: 'jelly', capacity: 2 }, // L0 #3
+      { id: 'j10', color: 'yellow', shape: 'cube',  capacity: 2 }, // L1 #3
+      { id: 'j11', color: 'green',  shape: 'jelly', capacity: 2 }, // L2 #3
+      { id: 'j12', color: 'green',  shape: 'jelly', capacity: 2 }, // L3 #3
+      { id: 'j13', color: 'yellow', shape: 'cube',  capacity: 2 }, // L0 back (hidden)
+      { id: 'j14', color: 'green',  shape: 'jelly', capacity: 2 }, // L1 back (hidden)
+      { id: 'j15', color: 'blue',   shape: 'bean',  capacity: 2 }, // L2 back (hidden)
+      { id: 'j16', color: 'yellow', shape: 'cube',  capacity: 2 }, // L3 back (hidden)
     ],
     centerContainer: { capacity: 6 },
   },

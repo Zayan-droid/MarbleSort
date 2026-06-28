@@ -70,10 +70,38 @@ function tapSmart(state) {
   return false;
 }
 
+// A dedicated ALL-ROUTABLE level for the dispenser/pipeline mechanic tests (partA, partC): its four
+// lane fronts are four DIFFERENT colors, so EVERY front-row candy has an active jar and auto-routes
+// the moment it settles. This keeps partA/partC testing the funnel + pipeline + auto-route mechanic
+// independent of the SHIPPED level 0, which now deliberately leaves some colors unroutable (buffered)
+// — that buffering behaviour is covered by partB/partE/partJ instead. (This is the old Latin-square
+// arrangement of level 0.)
+const ROUTABLE_LEVEL = {
+  name: 'Routable (mechanic test)',
+  packetSlots: 6,
+  packets: [
+    { color: 'red', count: 8 }, { color: 'yellow', count: 8 },
+    { color: 'blue', count: 8 }, { color: 'green', count: 8 },
+  ],
+  jars: [
+    { color: 'red',    capacity: 2 }, { color: 'yellow', capacity: 2 },
+    { color: 'blue',   capacity: 2 }, { color: 'green',  capacity: 2 },
+    { color: 'yellow', capacity: 2 }, { color: 'blue',   capacity: 2 },
+    { color: 'green',  capacity: 2 }, { color: 'red',    capacity: 2 },
+    { color: 'blue',   capacity: 2 }, { color: 'green',  capacity: 2 },
+    { color: 'red',    capacity: 2 }, { color: 'yellow', capacity: 2 },
+    { color: 'green',  capacity: 2 }, { color: 'red',    capacity: 2 },
+    { color: 'yellow', capacity: 2 }, { color: 'blue',   capacity: 2 },
+  ],
+  centerContainer: { capacity: 6 },
+};
+const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
+
 // ---- Part A: ONE tap drops ONE candy; the tray pipeline caps at the center capacity ----
 {
   resetCounts();
   const state = new PuzzleGame();
+  state.loadLevel(ROUTABLE_IX);
   state.resize(900, 1000);
 
   const first = state.tappableSlots()[0];
@@ -146,6 +174,7 @@ function tapSmart(state) {
 {
   resetCounts();
   const state = new PuzzleGame();
+  state.loadLevel(ROUTABLE_IX); // all-routable fronts (see ROUTABLE_LEVEL): the dropped candy always routes
   state.resize(900, 1000);
   const f = state.tappableSlots()[0];
   const fColor = state.packets.slots[f].color;
@@ -291,6 +320,53 @@ function tapSmart(state) {
   if (!preview) fail('partI: the 16-jar level should have preview jars behind the fronts');
   else if (state.onJarTapped(preview.id) !== false) fail('partI: a preview jar must not collect candies');
   console.log('partI queues: 16 jars across 4 lanes, 12 visible, only the 4 fronts active/collectable');
+}
+
+// ---- Part J: the shipped level 0 FORCES buffering — greedy+buffer wins using the center, ----
+// ----         and careless "tap everything" play gets STUCK (proves the redesign). ----------
+{
+  // (a) Sensible play: greedy-route what an active jar takes, buffer the rest in the center.
+  resetCounts();
+  const state = new PuzzleGame();
+  state.resize(900, 1000);
+  // At the start three lane-fronts are red + one blue, so GREEN and YELLOW have no active jar.
+  const startFronts = state.jars.activeJars().map((j) => j.colorKey).sort();
+  const startColors = new Set(startFronts);
+  if (startColors.size >= 4) fail(`partJ: redesign should NOT start with 4 different active colors (got ${[...startColors]})`);
+  const collectableAtStart = new Set(state.jars.activeJars().map((j) => j.colorKey));
+  const allColors = new Set(state.packets.slots.map((s) => s.color).filter(Boolean));
+  const mustWait = [...allColors].filter((c) => !collectableAtStart.has(c));
+  if (mustWait.length < 1) fail('partJ: at least one supplied color should have NO active jar at the start (must wait)');
+
+  let guard = 0, maxCenter = 0;
+  const waited = new Set(); // colors that at some point sat in the center with no active jar to take them
+  while (state.phase === 'playing' && guard++ < 800) {
+    let any = false;
+    while (tapSmart(state)) any = true;
+    if (!any && state._idle() && state.packets.hasRemainingPackets()) any = tapFront(state);
+    settle(state);
+    maxCenter = Math.max(maxCenter, state.center.count());
+    for (const c of state.center.colorsPresent()) if (!state.jars.anyAccepts(c)) waited.add(c);
+    if (!any && state._idle()) break;
+  }
+  if (state.phase !== 'win') fail(`partJ: greedy+buffer play should WIN (phase=${state.phase})`);
+  if (maxCenter < 2) fail(`partJ: the center buffer should genuinely be used (peak only ${maxCenter})`);
+  if (waited.size < 1) fail('partJ: no color ever had to WAIT in the center — buffering not exercised');
+
+  // (b) Careless play: dump the first tappable candy every time, no thought → should get STUCK.
+  resetCounts();
+  const dumb = new PuzzleGame();
+  dumb.resize(900, 1000);
+  let g2 = 0;
+  while (dumb.phase === 'playing' && g2++ < 800) {
+    let any = false;
+    while (tapFront(dumb)) any = true; // greedily dump everything
+    settle(dumb);
+    if (!any && dumb._idle()) break;
+  }
+  if (dumb.phase !== 'lose') fail(`partJ: careless tap-everything play should be able to get STUCK (phase=${dumb.phase})`);
+
+  console.log(`partJ buffer: level 0 starts with active colors {${startFronts.join(',')}}, forces {${mustWait.join(',')}} to wait; greedy+buffer wins (center peak ${maxCenter}/6, waited: ${[...waited].join(',')}), careless play gets stuck`);
 }
 
 // ---- Part H: responsive layout across sizes / aspect ratios ----------------
