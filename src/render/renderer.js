@@ -7,7 +7,7 @@
 // vignette, HUD pills and the debug overlay. Reads candy positions from GameState.
 
 import { bus, EV } from '../core/events.js';
-import { COLORS, THEME, RENDER, RULES, BIN, DIAL, ART, PACKET, CENTER, JAR } from '../config.js';
+import { COLORS, THEME, RENDER, RULES, BIN, DIAL, ART, PACKET, CENTER, JAR, SCORING } from '../config.js';
 import candyUrl from '../../newcandy/newcandies.png';
 import dispenserUrl from '../../candyDispenser/candy_dispenser.png';
 import jarUrl from '../../Jar/jars.png';
@@ -62,6 +62,7 @@ export class Renderer {
     this.dpr = Math.min(window.devicePixelRatio || 1, 2);
     this.w = 0; this.h = 0;
     this.particles = [];
+    this.floatTexts = [];   // soft +N score pops (Phase 3 feel-layer); empty when SCORING.score.enabled is false
     this.fps = 60;
     this.debug = false;
 
@@ -118,9 +119,29 @@ export class Renderer {
     // the frame matching its seated-candy count instead of stacking individual candies.
     this.trayFrameImgs = this._loadFrameSheets(indexFrameSheets(TRAY_URLS));
 
-    bus.on(EV.BOX_CLEAR, ({ x, y, color }) => this._burst(x, y, color));
+    bus.on(EV.BOX_CLEAR, ({ x, y, color, comboIndex = 1, clutch = false, multiplier = false, pourStreak = 1, rowStreak = 1 }) => {
+      // HYPE LEVEL: a cross-lane CASCADE (comboIndex), a vertical CHAIN down a lane (pourStreak), and a
+      // horizontal CHAIN across the front row (rowStreak) all escalate — take whichever is deepest.
+      const hype = Math.min(Math.max(comboIndex, pourStreak, rowStreak), SCORING.combo.maxLink);
+      // FEEL-LAYER: the sparkle GROWS with the hype, the clutch pressure, and a multiplier candy.
+      const scale = (1 + (hype - 1) * SCORING.combo.sparkleScale)
+        * (clutch ? 1 + SCORING.clutch.sparkleBoost : 1)
+        * (multiplier ? 1 + SCORING.multiplier.sparkleBoost : 1);
+      this._burst(x, y, color, scale);
+      // Phase 3: a floating +N that rides the burst, grows with hype, and fades. Toggleable off.
+      if (SCORING.score.enabled) {
+        const s = SCORING.score;
+        const n = Math.round(s.base * comboIndex * (clutch ? s.clutchMult : 1) * (multiplier ? SCORING.multiplier.value : 1));
+        const sz = Math.min(s.maxScale, 1 + (hype - 1) * s.growthPerLevel) * (clutch || multiplier ? s.specialBump : 1);
+        this.floatTexts.push({ x, y, n, hype, clutch, multiplier, pourStreak, rowStreak, sz, age: 0, life: s.floatMs });
+      }
+    });
     bus.on(EV.MARBLE_SEAT, ({ x, y, color }) => this._burst(x, y, color, 0.4));
     bus.on(EV.CANDY_RELEASE, ({ x, y, color }) => this._sparkle(x, y, color));
+    // PEG TICK (item 2): a small bright spark flicks off the struck pin — a few candy-coloured motes
+    // plus a couple of warm sparks, scaled by how hard the candy hit. (The pin's own glow flare is
+    // driven by peg._pulse, set in the sim and decayed in _drawPegs.)
+    bus.on(EV.PEG_HIT, ({ x, y, color, speed01 = 0.5 }) => this._pegSpark(x, y, color, speed01));
   }
 
   resize() {
@@ -362,6 +383,66 @@ export class Renderer {
     }
   }
 
+  // PEG TICK spark (item 2): a small flick of candy-coloured + warm-white motes off a struck pin,
+  // scaled by how hard the candy hit. Tiny + short so a dense pachinko rain shimmers, never clutters.
+  _pegSpark(x, y, colorKey, speed01 = 0.5) {
+    const col = COLORS[colorKey] || { light: '#fff', base: '#fff' };
+    const n = 2 + Math.round(4 * speed01);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = (28 + Math.random() * 120) * (0.5 + speed01);
+      this.particles.push({
+        x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 18, age: 0,
+        life: 170 + Math.random() * 150,
+        r: 1 + Math.random() * 1.7, color: (Math.random() < 0.5) ? '#fff3c4' : (col.light || col.base),
+      });
+    }
+  }
+
+  // ITEM 2: draw the funnel PEG FIELD — small glossy pins in the throat. Each pin flares warm when a
+  // candy ticks off it (peg._pulse is set to 1 in the sim on a strike; we decay it here off dt so the
+  // flare is a soft ~0.25s glow). Candies are drawn AFTER this, so they tumble in front of the pins.
+  _drawPegs(ctx, state, dt) {
+    const d = state.layout && state.layout.dispenser;
+    const pegs = d && d.colliders && d.colliders.pegs;
+    if (!pegs || !pegs.length) return;
+    ctx.save();
+    for (const pg of pegs) {
+      const r = pg.r;
+      const pulse = pg._pulse || 0;
+      const lit = pulse > 0.01;
+      if (lit) {
+        // warm flare halo on a strike (additive)
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.globalAlpha = 0.55 * pulse;
+        const rr = r * (3.0 + 2.5 * pulse);
+        const gr = ctx.createRadialGradient(pg.x, pg.y, r * 0.4, pg.x, pg.y, rr);
+        gr.addColorStop(0, 'rgba(255,238,190,1)');
+        gr.addColorStop(1, 'rgba(255,238,190,0)');
+        ctx.fillStyle = gr;
+        ctx.beginPath(); ctx.arc(pg.x, pg.y, rr, 0, Math.PI * 2); ctx.fill();
+        ctx.globalCompositeOperation = 'source-over';
+        pg._pulse = pulse - dt * 4;   // ~0.25s flare
+      }
+      // the pin: a glossy little dome (radial gradient + a specular highlight + a soft rim)
+      ctx.globalAlpha = 1;
+      const g = ctx.createRadialGradient(pg.x - r * 0.4, pg.y - r * 0.5, r * 0.1, pg.x, pg.y, r * 1.15);
+      g.addColorStop(0, lit ? '#fffef4' : '#f3f5fb');
+      g.addColorStop(0.5, lit ? '#ffe6a0' : '#c7cede');
+      g.addColorStop(1, '#7f8aa3');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(pg.x, pg.y, r, 0, Math.PI * 2); ctx.fill();
+      ctx.lineWidth = Math.max(0.5, r * 0.14);
+      ctx.strokeStyle = 'rgba(40,48,66,0.45)';
+      ctx.stroke();
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.beginPath(); ctx.arc(pg.x - r * 0.34, pg.y - r * 0.42, r * 0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
   // --- primitives -----------------------------------------------------------
 
   // Trace the body outline of a candy at (x,y) sized to radius r. Each shape is a
@@ -530,6 +611,7 @@ export class Renderer {
     const L = state.layout;
     if (!L) return;
     this.fps += ((1 / Math.max(dt, 1e-4)) - this.fps) * 0.1;
+    this._t = (this._t || 0) + dt;   // renderer clock (s) for the special-candy glint pulse
 
     if (this.bgReady) {
       // cover-fit the candy background (fill the viewport, preserve aspect, crop overflow)
@@ -543,14 +625,17 @@ export class Renderer {
     }
 
     this._drawDispenser(ctx, state);
+    this._drawPegs(ctx, state, dt);   // item 2: the funnel pin field (candies tumble in front of it)
     this._drawPacketsPuzzle(ctx, state);
     this._drawCenterBox(ctx, state);
     this._drawJarsPuzzle(ctx, state);
     this._drawCandies(ctx, state);
     this._drawJarLids(ctx, state);
     this._drawTransit(ctx, state);
+    this._drawRejecting(ctx, state);   // candies rolling back out of an over-filled tray
     this._updateParticles(ctx, dt);
     this._drawVignette(ctx);
+    this._updateFloatTexts(ctx, dt);
     this._drawHudPuzzle(ctx, state);
     if (this.debug) { this._drawDispenserDebug(ctx, state); this._drawDebugPuzzle(ctx, state); }
   }
@@ -982,6 +1067,66 @@ export class Renderer {
     ctx.globalAlpha = 1;
   }
 
+  // Phase 3: soft floating "+N" score pops. They rise + fade over SCORING.score.floatMs (driven off
+  // the render dt clock, not the game clock) and ride on top of the existing sensory burst. Disabling
+  // SCORING.score.enabled means none are ever pushed, so this loop is a no-op (pure ASMR).
+  _updateFloatTexts(ctx, dt) {
+    if (!this.floatTexts.length) return;
+    const ms = dt * 1000;
+    const S = SCORING.score;
+    const rise = S.riseFrac * Math.min(this.w, this.h);
+    const baseFont = Math.max(14, Math.min(this.w, this.h) * 0.05);
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (let i = this.floatTexts.length - 1; i >= 0; i--) {
+      const f = this.floatTexts[i];
+      f.age += ms;
+      if (f.age >= f.life) { this.floatTexts.splice(i, 1); continue; }
+      const t = f.age / f.life;                 // 0..1
+      const a = t < 0.12 ? t / 0.12 : 1 - (t - 0.12) / 0.88; // quick rise-in, slow fade
+      // punch-in: a brief scale overshoot at birth that settles in the first ~quarter of the life
+      const punch = 1 + S.punch * Math.max(0, 1 - t / 0.25);
+      const px = Math.round(baseFont * f.sz * punch);
+      const y = f.y - rise * t;
+      const tier = S.tierColors[Math.min(f.hype, S.tierColors.length) - 1] || '#fff';
+      // the big +N
+      ctx.font = `800 ${px}px -apple-system, system-ui, sans-serif`;
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.lineWidth = Math.max(2, px * 0.16);
+      ctx.strokeStyle = 'rgba(18,14,6,0.62)';
+      ctx.strokeText(`+${f.n}`, f.x, y);
+      ctx.fillStyle = tier;
+      ctx.fillText(`+${f.n}`, f.x, y);
+      // a celebratory label above it for real chains/cascades (and clutch/multiplier flavour). Name
+      // the sweep AXIS: a vertical run down a lane = CHAIN, a horizontal run across the row = ROW,
+      // otherwise a mixed cross-lane cascade = COMBO.
+      if (f.hype >= S.labelAtLevel || f.clutch || f.multiplier) {
+        const bits = [];
+        if (f.multiplier) bits.push('★');
+        if (f.hype >= S.labelAtLevel) {
+          if (f.pourStreak >= S.labelAtLevel && f.pourStreak >= f.rowStreak) bits.push(`CHAIN ×${f.pourStreak}`);
+          else if (f.rowStreak >= S.labelAtLevel) bits.push(`ROW ×${f.rowStreak}`);
+          else bits.push(`COMBO ×${f.hype}`);
+        }
+        if (f.clutch) bits.push('CLUTCH');
+        const lab = bits.join('  ');
+        if (lab) {
+          const lpx = Math.max(11, Math.round(px * 0.4));
+          ctx.font = `800 ${lpx}px -apple-system, system-ui, sans-serif`;
+          ctx.globalAlpha = Math.max(0, a) * 0.95;
+          ctx.lineWidth = Math.max(1.5, lpx * 0.2);
+          ctx.strokeStyle = 'rgba(18,14,6,0.62)';
+          ctx.strokeText(lab, f.x, y - px * 0.72);
+          ctx.fillStyle = tier;
+          ctx.fillText(lab, f.x, y - px * 0.72);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
   _drawVignette(ctx) {
     const g = ctx.createRadialGradient(
       this.w / 2, this.h / 2, Math.min(this.w, this.h) * 0.35,
@@ -1066,12 +1211,14 @@ export class Renderer {
       const box = tl.r * 2;
       // a candy still BEHIND another (blocked by the dispenser-stack rule) is dimmed, so the
       // tappable front-row candies read as the live ones.
-      ctx.globalAlpha = state._dispenseBlocked(i) ? 0.42 : 1;
+      const dim = state._dispenseBlocked(i) ? 0.42 : 1;
+      ctx.globalAlpha = dim;
       // each cell IS a candy: blit its art (procedural candy stands in until the sheet loads)
       if (!this._blitCandySprite(ctx, col, tl.x, tl.y, box * 0.98)) {
         this._candy(ctx, tl.x, tl.y, tl.r * 0.82, col, { shape: col && col.shape });
       }
       ctx.globalAlpha = 1;
+      if (slots[i].special) this._specialGlint(ctx, tl.x, tl.y, tl.r, dim);
     }
   }
 
@@ -1112,10 +1259,11 @@ export class Renderer {
   _jarClose(state, jar, bl) {
     if (!jar.complete) return null;
     const d = JAR.close;
+    const m = jar._durMul || 1;             // held-sweep tempo: match the logic's accelerated close
     const t = state._time - (jar._clearStart || 0);
-    const drop = clamp01(t / d.lidDropMs);
+    const drop = clamp01(t / (d.lidDropMs * m));
     const ed = 1 - Math.pow(1 - drop, 3); // ease-out
-    const fade = clamp01((t - d.lidDropMs - d.holdMs) / d.fadeMs);
+    const fade = clamp01((t - (d.lidDropMs + d.holdMs) * m) / (d.fadeMs * m));
     const jarTop = bl.y - bl.h / 2;
     const restCy = jarTop + bl.h * 0.16;   // where the lid seats over the rim
     const startCy = restCy - bl.h * 0.75;  // drops from above
@@ -1240,10 +1388,30 @@ export class Renderer {
       const sq = c.where === 'center' ? this._squashOf(c) : null;
       // seated candies (center tray + jars) are grounded: a soft contact shadow + faint top gloss.
       if (col) this._candy(ctx, p.x, p.y, r, col, { scale: state.candyPop(c), shape: col.shape, angle: (c.restAngle || 0) + extraAngle, squash: sq, ground: true });
+      if (c.special) this._specialGlint(ctx, p.x, p.y, r, ctx.globalAlpha);
       ctx.globalAlpha = 1;
     };
     for (const c of all) if (!c.anim) draw(c);
     for (const c of all) if (c.anim) draw(c);
+  }
+
+  // Candies ROLLING BACK OUT of an over-filled tray (overfill rollback): float up from their tray
+  // spot and fade, then they re-queue to the rack. A quick, readable "that didn't fit" bounce.
+  _drawRejecting(ctx, state) {
+    const list = state.rejecting;
+    if (!list || !list.length) return;
+    const L = state.layout.center;
+    const dur = CENTER.overfill.fadeMs, rise = CENTER.overfill.riseFrac * L.h;
+    for (const c of list) {
+      const t = clamp01((state._time - c._rejT0) / dur);
+      const ease = 1 - Math.pow(1 - t, 2);
+      const r = state.candyRadius(c), col = COLORS[c.colorKey];
+      if (!col) continue;
+      ctx.save();
+      ctx.globalAlpha = 1 - t;
+      this._candy(ctx, c._rejX, c._rejY - rise * ease, r, col, { shape: col.shape, angle: c.restAngle || 0 });
+      ctx.restore();
+    }
   }
 
   // ---- candies spilling through the dispenser (physics transit objects) ----
@@ -1252,7 +1420,59 @@ export class Renderer {
       const col = COLORS[c.colorKey];
       if (!col) continue;
       this._candy(ctx, c.x, c.y, c.r, col, { shape: col.shape, angle: c.angle || 0, squash: this._squashOf(c) });
+      if (c.special) this._specialGlint(ctx, c.x, c.y, c.r);
     }
+  }
+
+  // Marks a "special" MULTIPLIER candy so a first-timer reads "bonus" in a second: a warm gold
+  // shimmer (halo + twinkling stars) that says "treasure", PLUS an explicit "×N" badge that names
+  // the multiplier. Drawn OVER the candy sprite. `alpha` fades it with a closing jar.
+  _specialGlint(ctx, x, y, r, alpha = 1) {
+    const t = this._t || 0;
+    const pulse = 0.5 + 0.5 * Math.sin(t * 4.5);
+    ctx.save();
+    // --- warm gold shimmer: a soft halo + three twinkling 4-point stars orbiting the candy ---
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = (0.14 + 0.16 * pulse) * alpha;
+    const halo = ctx.createRadialGradient(x, y, r * 0.4, x, y, r * 1.5);
+    halo.addColorStop(0, 'rgba(255,224,140,0.9)');
+    halo.addColorStop(1, 'rgba(255,224,140,0)');
+    ctx.fillStyle = halo;
+    ctx.beginPath(); ctx.arc(x, y, r * 1.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,250,225,1)';
+    for (let k = 0; k < 3; k++) {
+      const a = t * 1.6 + k * ((Math.PI * 2) / 3);
+      const tw = 0.5 + 0.5 * Math.sin(t * 5 + k * 2.1);   // per-star twinkle
+      ctx.globalAlpha = (0.3 + 0.55 * tw) * alpha;
+      this._sparkleStar(ctx, x + Math.cos(a) * r * 0.95, y + Math.sin(a) * r * 0.95, r * (0.16 + 0.12 * tw));
+    }
+    // --- the ×N badge, pinned upper-right: explicit "this is a multiplier candy" ---
+    ctx.globalCompositeOperation = 'source-over';
+    const bx = x + r * 0.72, by = y - r * 0.72, br = Math.max(7, r * 0.46);
+    ctx.globalAlpha = (0.35 * pulse) * alpha;            // attention pulse ring behind the badge
+    ctx.strokeStyle = '#fff3c4'; ctx.lineWidth = Math.max(1, br * 0.14);
+    ctx.beginPath(); ctx.arc(bx, by, br * (1.12 + 0.28 * pulse), 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = alpha;
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffcf45'; ctx.fill();
+    ctx.lineWidth = Math.max(1, br * 0.16); ctx.strokeStyle = 'rgba(120,72,0,0.9)'; ctx.stroke();
+    ctx.fillStyle = '#5a3200';
+    ctx.font = `800 ${Math.round(br * 1.05)}px -apple-system, system-ui, sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(`×${SCORING.multiplier.value}`, bx, by + br * 0.06);
+    ctx.restore();
+  }
+
+  // A small filled 4-point sparkle (concave star) used by the special-candy shimmer.
+  _sparkleStar(ctx, cx, cy, s) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - s);
+    ctx.quadraticCurveTo(cx + s * 0.18, cy - s * 0.18, cx + s, cy);
+    ctx.quadraticCurveTo(cx + s * 0.18, cy + s * 0.18, cx, cy + s);
+    ctx.quadraticCurveTo(cx - s * 0.18, cy + s * 0.18, cx - s, cy);
+    ctx.quadraticCurveTo(cx - s * 0.18, cy - s * 0.18, cx, cy - s);
+    ctx.closePath();
+    ctx.fill();
   }
 
   // ---- debug: stroke the dispenser colliders so the DISPENSER fractions can be tuned ----
@@ -1275,6 +1495,11 @@ export class Renderer {
     ctx.beginPath();
     ctx.moveTo(C.pathLeft, C.exitY); ctx.lineTo(C.pathRight, C.exitY);         // exit line
     ctx.stroke();
+    // funnel PEGS (item 2): stroke each pin's collision circle so the field can be tuned
+    if (C.pegs && C.pegs.length) {
+      ctx.strokeStyle = 'rgba(255,210,90,0.95)';
+      for (const pg of C.pegs) { ctx.beginPath(); ctx.arc(pg.x, pg.y, pg.r, 0, Math.PI * 2); ctx.stroke(); }
+    }
     ctx.restore();
   }
 

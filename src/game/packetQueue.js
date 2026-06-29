@@ -8,7 +8,7 @@
 // blocks. Order is deterministic (no Math.random) so the headless smoketest is reproducible.
 
 import { resolveColor } from './traySlots.js';
-import { CENTER, DISPENSER } from '../config.js';
+import { CENTER, DISPENSER, SCORING } from '../config.js';
 
 export class PacketQueueManager {
   constructor(levelData, rackCapacity) {
@@ -20,15 +20,21 @@ export class PacketQueueManager {
     }));
     const counts = groups.map((g) => g.n);
     let left = counts.reduce((a, b) => a + b, 0);
+    // each queue entry is { color, special }. `special` (the multiplier candy) is flagged below.
     this.queue = [];
     while (left > 0) {
       for (let i = 0; i < groups.length; i++) {
-        if (counts[i] > 0) { this.queue.push(groups[i].color); counts[i]--; left--; }
+        if (counts[i] > 0) { this.queue.push({ color: groups[i].color, special: false }); counts[i]--; left--; }
       }
     }
+    // MULTIPLIER CANDY: deterministically flag every Nth candy in the flattened, interleaved queue
+    // (no Math.random, so the smoketest reproduces). The flag travels WITH the candy through
+    // dispense → center → jar and pays off only when it lands a jar's final slot.
+    const everyN = SCORING.multiplier.everyN;
+    if (everyN > 0) for (let i = 0; i < this.queue.length; i++) this.queue[i].special = (i + 1) % everyN === 0;
     // rack slots: filled from the front of the queue (extra slots stay empty if supply is small)
     const cap = rackCapacity || (levelData && levelData.rackCapacity) || (DISPENSER.rackCols * DISPENSER.rackRows);
-    this.slots = Array.from({ length: cap }, (_, i) => ({ slotId: i, color: null }));
+    this.slots = Array.from({ length: cap }, (_, i) => ({ slotId: i, color: null, special: false }));
     for (const s of this.slots) this._fill(s.slotId);
   }
 
@@ -42,10 +48,10 @@ export class PacketQueueManager {
   relayout(capacity) {
     if (capacity === this.slots.length) return;
     const remaining = [];
-    for (const s of this.slots) if (s.color) remaining.push(s.color);
+    for (const s of this.slots) if (s.color) remaining.push({ color: s.color, special: s.special });
     for (const c of this.queue) remaining.push(c);
     this.queue = remaining;
-    this.slots = Array.from({ length: capacity }, (_, i) => ({ slotId: i, color: null }));
+    this.slots = Array.from({ length: capacity }, (_, i) => ({ slotId: i, color: null, special: false }));
     for (const s of this.slots) this._fill(s.slotId);
   }
 
@@ -53,7 +59,9 @@ export class PacketQueueManager {
   _fill(slotId) {
     const slot = this.slotById(slotId);
     if (!slot) return null;
-    slot.color = this.queue.length ? this.queue.shift() : null;
+    const next = this.queue.length ? this.queue.shift() : null;
+    slot.color = next ? next.color : null;
+    slot.special = next ? next.special : false;
     return slot.color;
   }
 
@@ -70,24 +78,35 @@ export class PacketQueueManager {
     if (rows < 1) return;
     const start = (rows - 1) * cols;
     const lastRow = this.slots.slice(start);                 // the final row's slots, left→right
-    const colors = lastRow.filter((s) => s.color).map((s) => s.color);
-    if (!colors.length || colors.length >= lastRow.length) return; // empty or already full → nothing to do
-    const offset = Math.floor((lastRow.length - colors.length) / 2);
+    const items = lastRow.filter((s) => s.color).map((s) => ({ color: s.color, special: s.special }));
+    if (!items.length || items.length >= lastRow.length) return; // empty or already full → nothing to do
+    const offset = Math.floor((lastRow.length - items.length) / 2);
     if (offset <= 0) return;
     for (let c = 0; c < lastRow.length; c++) {
       const k = c - offset;
-      this.slots[start + c].color = (k >= 0 && k < colors.length) ? colors[k] : null;
+      const it = (k >= 0 && k < items.length) ? items[k] : null;
+      this.slots[start + c].color = it ? it.color : null;
+      this.slots[start + c].special = it ? it.special : false;
     }
   }
 
-  // TAP: drop the SINGLE candy in `slotIndex`. Returns a 1-length array of its color (so callers
-  // can treat it like a spill) and refills the slot from the queue, or null if the slot is empty.
+  // TAP: drop the SINGLE candy in `slotIndex`. Returns { color, special } and refills the slot from
+  // the queue, or null if the slot is empty. (`special` = the multiplier candy — see constructor.)
   consume(slotIndex) {
     const slot = this.slots[slotIndex];
     if (!slot || !slot.color) return null;
-    const color = slot.color;
+    const out = { color: slot.color, special: !!slot.special };
     this._fill(slot.slotId); // next queued candy (or null) slides into the slot
-    return [color];
+    return out;
+  }
+
+  // Return a candy to the SUPPLY — e.g. it rolled back out of an over-filled tray. Push it to the
+  // FRONT of the queue and, if a rack slot is open, deal it straight back in so the player sees it
+  // return to the dispenser (keeps the level's supply/demand balance intact → still winnable).
+  returnCandy(color, special = false) {
+    this.queue.unshift({ color, special: !!special });
+    const empty = this.slots.find((s) => !s.color);
+    if (empty) this._fill(empty.slotId);
   }
 
   // Total candies still to be dispensed (sitting in the rack + waiting in the queue).

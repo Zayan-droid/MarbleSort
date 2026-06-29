@@ -9,7 +9,7 @@
 // Every synth voice is a small factory function, so a real sample could later
 // replace any single voice without touching the rest of the graph.
 
-import { AUDIO } from '../config.js';
+import { AUDIO, SCORING } from '../config.js';
 
 function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
 function clamp01(x) { return clamp(x, 0, 1); }
@@ -309,30 +309,101 @@ class AudioEngine {
     sine.stop(t + AUDIO.seatDecay + 0.02);
   }
 
-  // Soft ascending chime when a box clears.
-  clear() {
+  // Soft ascending chime when a box clears. The feel-layer raises pitch with the combo link and
+  // brightens (gain) on clutch / multiplier completions. opts: { comboIndex, clutch, multiplier }.
+  clear(opts = {}) {
     if (!this.ready) return;
+    const { comboIndex = 1, clutch = false, multiplier = false } = opts;
+    // rising pitch across a cascade: link 1 = baseline, each extra link adds pitchStepCents.
+    const ratio = Math.pow(2, ((comboIndex - 1) * SCORING.combo.pitchStepCents) / 1200);
+    // brighter (louder) chime: fuller with each combo link, and on clutch / multiplier completions.
+    const gain = AUDIO.clearGain
+      * (1 + (comboIndex - 1) * SCORING.combo.comboGain
+          + (clutch ? SCORING.clutch.chimeBoost : 0)
+          + (multiplier ? SCORING.multiplier.chimeBoost : 0));
     const ctx = this.ctx;
     const t0 = ctx.currentTime;
     AUDIO.clearNotes.forEach((f, i) => {
       const t = t0 + (i * AUDIO.clearStepMs) / 1000;
       const g = ctx.createGain();
       g.gain.setValueAtTime(0.0001, t);
-      g.gain.exponentialRampToValueAtTime(AUDIO.clearGain, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.01);
       g.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
       const o = ctx.createOscillator();
       o.type = 'sine';
-      o.frequency.value = f;
+      o.frequency.value = f * ratio;
       const o2 = ctx.createOscillator();
       o2.type = 'sine';
-      o2.frequency.value = f * 2;
+      o2.frequency.value = f * ratio * 2;
       const o2g = ctx.createGain();
-      o2g.gain.value = AUDIO.clearGain * 0.25;
+      o2g.gain.value = gain * 0.25;
       o.connect(g); o2.connect(o2g); o2g.connect(g);
       g.connect(this.busLowpass);
       o.start(t); o2.start(t);
       o.stop(t + 0.4); o2.stop(t + 0.4);
     });
+  }
+
+  // PEG TICK (item 2) — the pachinko / music-box voice as a candy ticks off a funnel pin. A soft
+  // triangle pluck on a PENTATONIC step (so any chaotic tumble still plays a pleasant little run), a
+  // glassy bell partial that "tings" and decays faster, plus a tiny resonant "pock" transient (the
+  // marble striking the pin). Panned to the pin and sent through the bus so it picks up the reverb
+  // tail — that wash is what makes a rain of ticks read as ASMR. opts: { note01, speed01, pan }.
+  peg(opts = {}) {
+    if (!this.ready) return;
+    const P = AUDIO.peg;
+    const { note01 = 0.5, speed01 = 0.5, pan = 0 } = opts;
+    const ctx = this.ctx;
+    const t = ctx.currentTime;
+    // pentatonic pitch by pin height (top pin = high); a touch brighter on a harder strike, plus a
+    // hair of humanizing detune so repeated ticks off the same pin aren't mechanically identical.
+    const semis = (P.semis && P.semis.length) ? P.semis : [0];
+    const idx = clamp(Math.round(note01 * (semis.length - 1)), 0, semis.length - 1);
+    const cents = (P.speedToPitchCents || 0) * speed01 + (Math.random() * 6 - 3);
+    const f = P.baseHz * Math.pow(2, semis[idx] / 12) * Math.pow(2, cents / 1200);
+    const vol = P.gain * (0.5 + (P.speedToGain || 0) * speed01);
+    const dec = P.decay;
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = clamp(pan, -1, 1);
+    panner.connect(this.busLowpass);
+
+    // body: a soft triangle pluck (music-box mallet) — near-instant attack, exponential decay
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.003);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dec);
+    const o = ctx.createOscillator();
+    o.type = 'triangle';
+    o.frequency.value = f;
+    o.connect(g); g.connect(panner);
+
+    // glassy bell partial (overtone), decays faster than the body for a bright "ting" on top
+    const o2 = ctx.createOscillator();
+    o2.type = 'sine';
+    o2.frequency.value = f * (P.partial || 2);
+    const o2g = ctx.createGain();
+    o2g.gain.setValueAtTime(0.0001, t);
+    o2g.gain.exponentialRampToValueAtTime(vol * (P.partialGain || 0.3), t + 0.003);
+    o2g.gain.exponentialRampToValueAtTime(0.0001, t + dec * 0.6);
+    o2.connect(o2g); o2g.connect(panner);
+    o.start(t); o2.start(t);
+    o.stop(t + dec + 0.03); o2.stop(t + dec + 0.03);
+
+    // onset "pock": a tiny resonant noise transient (the marble striking the pin); a band-pass keeps
+    // it woody, not clicky. Reads from a random offset of the shared noise so each tick differs.
+    if (P.tickGain > 0) {
+      const src = ctx.createBufferSource();
+      src.buffer = this._noise; src.loop = true;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = clamp(f * 3, 200, 9000); bp.Q.value = 5;
+      const ng = ctx.createGain();
+      const tv = P.tickGain * (0.5 + (P.speedToGain || 0) * speed01);
+      ng.gain.setValueAtTime(tv, t);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.028);
+      src.connect(bp); bp.connect(ng); ng.connect(panner);
+      src.start(t, Math.random() * 1.5); src.stop(t + 0.05);
+    }
   }
 
   // Soft low pulse when a jam is imminent.

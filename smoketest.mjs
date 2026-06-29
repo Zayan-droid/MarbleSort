@@ -8,7 +8,7 @@
 import { PuzzleGame } from './src/game/puzzle.js';
 import { validateLevel } from './src/game/levelValidator.js';
 import { bus, EV } from './src/core/events.js';
-import { LEVELS, DISPENSER } from './src/config.js';
+import { LEVELS, DISPENSER, SCORING, CENTER } from './src/config.js';
 
 const counts = { clink: 0, seat: 0, clear: 0, release: 0, win: 0, lose: 0, invalid: 0 };
 const resetCounts = () => Object.keys(counts).forEach((k) => { counts[k] = 0; });
@@ -19,6 +19,19 @@ bus.on(EV.CANDY_RELEASE, () => counts.release++);
 bus.on(EV.GAME_WIN, () => counts.win++);
 bus.on(EV.GAME_LOSE, () => counts.lose++);
 bus.on(EV.MOVE_INVALID, () => counts.invalid++);
+
+// FEEL-LAYER metadata on BOX_CLEAR (additive — must NOT change event counts or win/lose). Tracks the
+// combo/clutch/multiplier fields so we can assert the cascade carries escalating combo metadata.
+const feel = { payloads: 0, maxCombo: 0, badIndex: false, maxPourStreak: 0, maxRowStreak: 0 };
+const resetFeel = () => { feel.payloads = 0; feel.maxCombo = 0; feel.badIndex = false; feel.maxPourStreak = 0; feel.maxRowStreak = 0; };
+bus.on(EV.BOX_CLEAR, (p) => {
+  feel.payloads++;
+  const ci = p.comboIndex;
+  if (!Number.isInteger(ci) || ci < 1 || ci > SCORING.combo.maxLink) feel.badIndex = true;
+  else feel.maxCombo = Math.max(feel.maxCombo, ci);
+  if (Number.isInteger(p.pourStreak)) feel.maxPourStreak = Math.max(feel.maxPourStreak, p.pourStreak);
+  if (Number.isInteger(p.rowStreak)) feel.maxRowStreak = Math.max(feel.maxRowStreak, p.rowStreak);
+});
 
 const dt = 1 / 60;
 let ok = true;
@@ -137,6 +150,7 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
 // ---- Part B: tap front candies one at a time -> auto-sort -> WIN (level 0) ---------
 {
   resetCounts();
+  resetFeel();
   const state = new PuzzleGame();
   state.resize(900, 1000);
   const totalCandies = state.packets.remainingCandies(); // 32 individual candies
@@ -162,7 +176,37 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
   if (counts.release !== totalCandies) fail(`released ${counts.release}/${totalCandies}`);
   if (counts.seat !== totalCandies) fail(`seated ${counts.seat}/${totalCandies}`);
   if (counts.clear !== totalJars) fail(`cleared ${counts.clear}/${totalJars} jars`);
-  console.log(`partB win: ${totalCandies} candies tapped one-by-one, ${totalJars} jars filled (no storage)`);
+  // FEEL-LAYER: every completion carried combo metadata, indices stayed in [1, maxLink], and at
+  // least one real CASCADE (combo >= 2) occurred — the dopamine moment the layer recognizes.
+  if (feel.payloads !== counts.clear) fail(`partB combo metadata missing on ${counts.clear - feel.payloads} clears`);
+  if (feel.badIndex) fail('partB comboIndex out of [1, maxLink]');
+  if (feel.maxCombo < 2) fail(`partB no cascade detected (maxCombo=${feel.maxCombo})`);
+  // DIRECTIONAL SWEEP: _autoRoute's pour-lane preference should follow one lane to exhaustion, so at
+  // least one held same-lane sweep (>= 2 consecutive completions in one lane) must occur.
+  if (feel.maxPourStreak < 2) fail(`partB no held same-lane sweep detected (maxPourStreak=${feel.maxPourStreak})`);
+  console.log(`partB win: ${totalCandies} candies tapped one-by-one, ${totalJars} jars filled (no storage); maxCombo=${feel.maxCombo}, maxPourStreak=${feel.maxPourStreak}, maxRowStreak=${feel.maxRowStreak}`);
+}
+
+// ---- partK: multiplier-candy plumbing (feel-layer; additive, no gameplay change) ----------------
+// The `special` flag is deterministic (every SCORING.multiplier.everyN-th candy in the flattened
+// queue) and must survive consume(): rack/queue holds specials, consume hands the flag over.
+{
+  const state = new PuzzleGame();
+  state.resize(900, 1000);
+  const specials = state.packets.slots.filter((s) => s.special).length
+    + state.packets.queue.filter((q) => q.special).length;
+  if (specials < 1) fail('partK: no special (multiplier) candies flagged in the rack queue');
+  const si = state.packets.slots.findIndex((s) => s.special);
+  if (si >= 0) {
+    const out = state.packets.consume(si);
+    if (!out || out.special !== true) fail('partK: consume() lost the special flag');
+  }
+  const ni = state.packets.slots.findIndex((s) => s.color && !s.special);
+  if (ni >= 0) {
+    const out = state.packets.consume(ni);
+    if (!out || out.special !== false) fail('partK: a non-special candy was reported special');
+  }
+  console.log(`partK multiplier: ${specials} special candies flagged; consume() carries the flag`);
 }
 
 // ---- Part C: one candy per tap drains into its jar; the pipeline caps ----
@@ -179,14 +223,20 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
   const fJar = state.jars.jars.find((j) => j.colorKey === fColor);
   if (!state.center.isEmpty()) fail(`partC: center should auto-drain after the candy lands, holds ${state.center.count()}`);
   if (fJar.candies.length !== 1) fail(`partC: the one candy should route to its jar, got ${fJar.candies.length}`);
-  // fill the pipeline to capacity with front candies, then a further tap is rejected (silently)
+  // the smart-player cap (tapFront self-limits to capacity in flight):
   let n = 0;
   while (tapFront(state)) n++;
-  if (n !== state.center.capacity) fail(`partC: pipeline should cap at ${state.center.capacity}, dropped ${n}`);
-  const more = state.tappableSlots()[0];
-  if (more !== undefined && state.onPacketTapped(more) !== false) fail('partC: a drop beyond the tray pipeline must be rejected');
+  if (n !== state.center.capacity) fail(`partC: smart cap should be ${state.center.capacity}, dropped ${n}`);
+  // OVERFILL: a candy still TUMBLING isn't in the tray yet, so further taps are allowed into a brief
+  // overfill margin (not hard pre-blocked); only the hard ceiling (capacity + margin) refuses a tap.
+  let extra = 0, s;
+  while ((s = state.tappableSlots()[0]) !== undefined && state.onPacketTapped(s)) extra++;
+  if (extra !== CENTER.overfill.margin) fail(`partC: overfill should allow +${CENTER.overfill.margin} in flight, got ${extra}`);
+  if (state.transit.length + state.center.count() !== state.center.capacity + CENTER.overfill.margin) fail('partC: pipeline should sit at capacity+margin');
   settle(state);
-  console.log('partC: one tap drops one candy that drains to its jar; the tray pipeline caps at capacity');
+  // the jumble RESOLVES: auto-route takes what fits, the rest rolls back — center never stays over capacity
+  if (state.center.count() > state.center.capacity) fail(`partC: center left over capacity (${state.center.count()})`);
+  console.log(`partC: one tap drops one candy that drains; pipeline allows a +${CENTER.overfill.margin} overfill that resolves to <= capacity`);
 }
 
 // ---- Part D: the FRONT-FIRST rule — a candy unlocks only once the one in front is dispensed ----

@@ -6,7 +6,7 @@
 // remapped to native rich haptics (Capacitor Haptics / Core Haptics) WITHOUT
 // touching any game code — just swap the implementations below.
 
-import { HAPTICS } from '../config.js';
+import { HAPTICS, SCORING } from '../config.js';
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp01(x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
@@ -65,9 +65,27 @@ class Haptics {
     this._safeVibrate(HAPTICS.seatMs);
   }
 
-  // Celebratory triple-pulse when a box clears.
-  clear() {
-    this._safeVibrate(HAPTICS.clearPattern);
+  // Celebratory triple-pulse when a box clears. The feel-layer deepens it with the combo link and
+  // clutch — navigator.vibrate has no amplitude, so we scale the pulse DURATIONS (clamped).
+  // opts: { comboIndex, clutch, multiplier }.
+  clear(opts = {}) {
+    const { comboIndex = 1, clutch = false } = opts;
+    const intensity = 1
+      + (comboIndex - 1) * SCORING.combo.hapticStep
+      + (clutch ? SCORING.clutch.hapticBoost : 0);
+    const k = Math.min(intensity, 2.5); // cap so a long cascade doesn't buzz forever
+    this._safeVibrate(HAPTICS.clearPattern.map((ms) => Math.round(ms * k)));
+  }
+
+  // PEG TICK (item 2) — a very light, self-throttled pulse as a candy ticks off a funnel pin. Kept
+  // tiny + rate-limited (pegThrottleMs) so a dense pachinko cascade reads as a soft flutter on the
+  // motor, not a continuous buzz. Slightly longer on a harder strike.
+  pegTick(speed01 = 0.5) {
+    if (!this.enabled) return;
+    const now = this._now();
+    if (now - (this._lastPeg || 0) < HAPTICS.pegThrottleMs) return;
+    this._lastPeg = now;
+    this._safeVibrate(Math.max(3, Math.round(HAPTICS.pegTickMs * (0.7 + 0.6 * clamp01(speed01)))));
   }
 
   // Soft pulse when a jam is imminent.

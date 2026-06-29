@@ -237,6 +237,23 @@ export const AUDIO = {
   padNotes: [130.81, 196.0, 261.63],
   warnGain: 0.18,
   warnHz: 320,
+  // PEG TICK — the pachinko/music-box voice fired as a candy ticks off a funnel pin (item 2). A
+  // short, bright, pitched pluck with a bell partial + a tiny noise "pock", routed through the bus
+  // (so it picks up the reverb tail). Pitch follows a PENTATONIC scale by pin height, so a tumbling
+  // cascade always plays a pleasant little run regardless of the (chaotic) order pins are struck.
+  peg: {
+    gain: 0.30,
+    decay: 0.20,             // note length (s) — short, music-box-like
+    partial: 2.0,            // bell overtone ratio
+    partialGain: 0.32,
+    tickGain: 0.16,          // the noise transient (the marble "pock") at the very onset
+    baseHz: 523.25,          // C5 — the LOW end of the pin scale
+    semis: [0, 2, 4, 7, 9, 12, 14, 16, 19, 21], // C major PENTATONIC across two octaves
+    throttleMs: 15,          // min gap between ticks (musical, not a buzz)
+    maxPerFrame: 3,          // cap simultaneous ticks
+    speedToGain: 0.55,       // louder on harder hits (0 = flat)
+    speedToPitchCents: 110,  // a touch brighter on harder hits
+  },
 };
 
 export const HAPTICS = {
@@ -251,6 +268,10 @@ export const HAPTICS = {
   rumbleMinPulse: 6,
   rumbleMaxPulse: 16,
   rumbleSpeedRef: 6.0,
+  // PEG TICK — a very light, throttled pulse as a candy ticks off a funnel pin (item 2). Kept tiny
+  // and rate-limited so a dense pachinko cascade reads as a soft flutter, not a continuous buzz.
+  pegTickMs: 7,
+  pegThrottleMs: 22,
 };
 
 export const RENDER = {
@@ -305,6 +326,28 @@ export const CENTER = {
   // TILT: while the tray pours into a jar it TIPS toward that jar (see ANIM.pour). The tray art and
   // the candies still resting in it rotate together around a pivot near the tray's base. Cosmetic.
   tilt: { maxRad: 0.17, tauMs: 95, pivotYFrac: 0.62 },
+  // ITEM 4 — a "resting but live" pile. Settled candies stay exactly where they came to rest (no
+  // freeze→revive-all twitch) but act as light COLLIDERS: a NEW drop lands on the pile and only the
+  // neighbours it actually strikes WAKE and re-settle, so the drop RIPPLES through instead of the whole
+  // pile lifting and resetting. Bounded by the center capacity (≤6 bodies) so the contacts are nearly
+  // free. Toggle `enabled` (false = the old revive-the-whole-pile behaviour).
+  pile: {
+    enabled: true,
+    wakeSpeedFracH: 0.085,  // a resting candy WAKES only if a strike gives it more than this (×box height/s)
+    push: 0.45,             // how much a resting candy yields to the dropped candy on contact (0..1)
+  },
+  // OVERFILL — don't pre-block a tap the instant the pipeline hits capacity. A candy still TUMBLING
+  // down the funnel isn't "in the tray" yet, so the gate is raised by `margin`: the player can drop
+  // into a brief visual OVER-fill (a satisfying jumble, more bodies = more emergent collision). When
+  // the table then settles and auto-route has taken everything that logically fits, any candy still
+  // over capacity ROLLS BACK OUT to the rack with a reject cue — instead of a hard pre-block. Toggle
+  // `enabled` (false = the old strict pipeline cap).
+  overfill: {
+    enabled: true,
+    margin: 2,            // how far the pipeline (falling + in-tray) may exceed capacity before a tap is refused
+    riseFrac: 0.55,       // how far a rejected candy floats back up (frac of the tray box height) as it rolls out
+    fadeMs: 460,          // roll-back-out animation length (ms)
+  },
 };
 
 // BOTTOM jars — target containers, one color each, arranged as 4 QUEUE LANES along the bottom
@@ -368,8 +411,10 @@ export const ANIM = {
   intakeDurMs: 480,       // (legacy) chute -> center handoff — candies now tumble in via physics
   returnPackDurMs: 360,   // tray -> center: glide a retrieved group into its packed row
   bounce: 0.16,           // settle-bounce amplitude on arrival
-  autoRouteDelayMs: 240,  // pause after candies settle in the tray before they auto-flow onward,
-                          // so the player SEES them tumble in and rest before they leave
+  autoRouteDelayMs: 240,  // CASCADE rhythm: the beat between successive pours once a sweep is running
+                          // (it also shrinks with the sweep tempo). NOT used for the first route.
+  firstRouteDelayMs: 0,   // the FIRST route of a freshly-settled candy fires (near) immediately — as
+                          // soon as it's in the tray and a matching jar is active, it flows in, no wait
   // POUR: candies don't glide straight to a jar — the holding tray TIPS toward the target jar and
   // the matching candies roll over its lip and arc down in (a lip-then-drop quadratic Bézier; see
   // puzzle.js _pourCandies / candyScreenPos). One jar is poured at a time so the tray tilts a single
@@ -381,6 +426,72 @@ export const ANIM = {
     lipLiftFrac: 0.12, // how far the candy rises over the rim (frac of tray HEIGHT) before it drops
     spinTurns: 1.1,    // tumble (turns) a ROLLING candy makes during the pour; gummies/jelly don't spin
   },
+};
+
+// SCORING — the additive "superlinear reward" feel-layer. Purely sensory recognition of the
+// auto-route CASCADE the game already produces (one player tap can complete several jars in
+// sequence); it does NOT change route/settle/win-lose. Every tunable here, nothing in module code.
+export const SCORING = {
+  // COMBO — one player-triggered settle can complete several jars in sequence (the auto-route
+  // cascade). Each completion in that window escalates the feel. comboIndex is 1-based + clamped.
+  combo: {
+    maxLink: 4,           // clamp the link index used for feel (chain is hard-capped by lanes/capacity)
+    pitchStepCents: 120,  // chime detune added per EXTRA link (link 1 = baseline pitch)
+    sparkleScale: 0.7,    // extra particle-burst scale per extra hype level (cascade OR same-lane chain)
+    hapticStep: 0.35,     // extra haptic intensity per extra link
+    comboGain: 0.08,      // extra chime gain per extra link — deeper chains sound fuller, not just higher
+  },
+  // CLUTCH — completing a jar while the tray is still near-full = a high-pressure save.
+  clutch: {
+    thresholdFrac: 0.83,  // center fullness (count/capacity) at/above which a completion is clutch (5/6)
+    chimeBoost: 0.18,     // extra chime gain when clutch
+    sparkleBoost: 0.6,    // extra burst scale when clutch
+    hapticBoost: 0.4,     // extra haptic intensity when clutch
+  },
+  // MULTIPLIER CANDY (Phase 2) — every Nth candy in the dealt rack queue is "special"; pays off
+  // ONLY when it lands a jar's FINAL slot. Deterministic (no Math.random) so smoketest reproduces.
+  multiplier: {
+    everyN: 7,            // flag every 7th candy in the flattened, interleaved rack queue
+    value: 2,            // score multiplier when a special candy completes a jar
+    chimeBoost: 0.22,    // extra chime brightness on a multiplier completion (capped to that jar)
+    sparkleBoost: 0.8,   // extra burst scale on a multiplier completion
+  },
+  // SCORE POPUP (Phase 3) — a floating +N that rides the burst and fades. Not a scoreboard, but it
+  // GROWS with the hype level (cascade combo OR same-lane chain) so a big chain reads as a big reward.
+  score: {
+    enabled: true,       // set false for pure-ASMR (no number)
+    base: 100,           // N = base * comboIndex * (clutch?clutchMult:1) * (multiplier?multiplier.value:1)
+    clutchMult: 2,
+    floatMs: 1100,       // rise+fade lifetime (a touch longer so the big pops linger)
+    riseFrac: 0.08,      // float distance (frac of min screen dim)
+    growthPerLevel: 0.3, // popup font grows +30% per hype level beyond the first (chain/cascade depth)
+    maxScale: 2.8,       // cap on popup size
+    punch: 0.4,          // birth scale-overshoot (0 = none) — a satisfying pop-in
+    specialBump: 1.15,   // extra size when the completion is clutch and/or a multiplier
+    labelAtLevel: 2,     // show a "COMBO ×N" tag at/above this hype level
+    tierColors: ['#ffffff', '#ffe79a', '#ffb14e', '#ff7a8a'], // number colour by hype level (1,2,3,4+)
+  },
+};
+
+// POUR — the directional "held-tilt" sweep. When the center routes into a jar, the tray TILTS toward
+// that lane; if the SAME lane then advances and its new front jar can also be satisfied, the tray
+// HOLDS the tilt and keeps pouring down that one queue, jar after jar, accelerating — until the lane's
+// front can no longer be satisfied, then it re-aims or eases back to level. Tilt is purely cosmetic
+// (render transform); the only logic effect is a route-ORDER preference in _autoRoute (which jar fills
+// first), never which jars are fillable. All numbers here.
+export const POUR = {
+  angleDeg: 9,             // max tray tilt toward the lane being fed (deg) — cosmetic (~matches old feel)
+  easeTauMs: 90,           // ease toward an active pour target (smaller = snappier)
+  neutralReturnTauMs: 220, // ease back to level when no lane is being fed (slower = a gentle relax)
+  slidePx: 6,              // optional nudge of routed-out candies toward the low edge (cosmetic)
+  // ACCELERATION within a held sweep — works BOTH axes: consecutive completions DOWN a lane (vertical
+  // chain) or ACROSS the front row (horizontal chain). Each consecutive completion in the cascade
+  // scales the route/fill/close/lane-shift durations (AND the pre-pour rest beat) by factorPerLink **
+  // (cascade count), FLOORED at minMul so it never blurs. 0.6 → a normal jar is 1×, the next in the
+  // chain ≈0.6×, deeper jars ≈0.5× (the floor). The multiplier hits the pour, the fill, the close +
+  // disappear, and the gap before the next pour, so the whole chained-jar cycle is ~0.6 of a lone jar's.
+  speedup: { factorPerLink: 0.6, minMul: 0.5 },
+  perLaneReset: true,      // reset the VERTICAL chain counter (label only) when the pour lane changes
 };
 
 // ---- CANDY DISPENSER (the candy_dispenser.png packet rack + funnel physics) ----
@@ -471,6 +582,71 @@ export const DISPENSER = {
   impactVRef: 520,         // impact speed → full jiggle (scaled by dispenser width)
   wobbleMaxAmp: 0.42,      // hard cap on deformation amplitude (fraction of radius)
   bumpKick: 0.22,          // fraction of impact speed redirected sideways by a bumpy surface
+  // ---- ITEM 3: SHAPE-AWARE COLLISION + SETTLE ------------------------------------------------
+  // Each candy collides as a coarse ELLIPSE (half-extents from its drawn silhouette, matched to the
+  // renderer's _candyPath) instead of a uniform circle, and SETTLES per its shape: a cube snaps flat
+  // and sits stable, a diamond ROCKS on its point before tipping to an edge, beans/pills lie flat.
+  // Deterministic per colour (shape is fixed → smoketest still reproduces); the only effect is HOW a
+  // pile packs and rests, so piles never form the same way twice. Toggle `enabled`.
+  shape: {
+    enabled: true,
+    // half-extent multipliers (× collision radius) per silhouette + a SETTLE profile + rest `base`:
+    //   roll = no preferred angle (keeps rolling)   flat = lies on its long axis (180°-symmetric)
+    //   snap = snaps to nearest flat face (cube)     wobble = rocks on a point, then tips to an edge
+    profiles: {
+      round:   { wx: 1.00, hy: 0.96, settle: 'roll',   base: 0 },
+      oval:    { wx: 1.12, hy: 0.76, settle: 'flat',   base: 0 },
+      square:  { wx: 0.94, hy: 0.94, settle: 'snap',   base: 0 },
+      pill:    { wx: 0.68, hy: 1.04, settle: 'flat',   base: 1.5708 }, // lies on its side (≈90°)
+      diamond: { wx: 1.00, hy: 1.16, settle: 'wobble', base: 0.7854 }, // stable on an edge (≈45°)
+    },
+    angStiffness: 26,      // angular restoring strength toward the rest orientation (per s)
+    angDampFlat: 12,       // strong damping for flat/snap shapes → settle quickly + hold
+    angDampWobble: 2.4,    // light damping for a diamond → it ROCKS a few times on its point first
+    landKick: 3.5,         // angular kick (× normalized landing impact) a tippy shape gets on landing
+  },
+  // ---- ITEM 1: SEEDED COSMETIC VARIETY -------------------------------------------------------
+  // Deterministic per-candy jitter, seeded by a FIXED game seed XOR the candy id. Every dispensed
+  // candy launches + tumbles a little differently, while the LOGIC stays 100% reproducible (the
+  // headless smoketest only checks logical state + "settled", never pixel paths). Purely cosmetic.
+  variety: {
+    enabled: false,          // OFF — flip to true to re-enable seeded per-candy cosmetic variety
+    seed: 0x5eed,            // fixed game seed → reproducible; change it for a different "shuffle"
+    posJitterFrac: 0.55,     // spawn x/y scatter within the tapped cell, as a frac of candy radius
+    speedJitter: 0.35,       // ± on the initial spill speed
+    angleJitterRad: 0.42,    // ± on the initial spill direction (kept mostly downward)
+    spinJitter: 3.0,         // ± initial spin (rad/s) on the launch tumble
+    massJitter: 0.10,        // ± on mass (collision momentum)
+    restJitter: 0.07,        // ± on restitution (bounce)
+    radiusJitter: 0.06,      // ± on the COLLISION radius (pile-shape variety; draw size unchanged)
+    bumpBase: 0.05,          // give EVERY candy a little surface unevenness (path scatter)…
+    bumpJitter: 0.06,        // …plus a per-candy ± on top (added to the material's own bump)
+  },
+  // ---- ITEM 2: FUNNEL PEG FIELD (a Galton / pachinko board in the throat) ---------------------
+  // Pins in the narrowing throat BELOW the rack (so a spilled front candy actually rains through
+  // them) and ABOVE the chute mouth. A candy ticks off each pin — scatter + a pentatonic note +
+  // a spark — then the flanking pins guide it into the chute. Geometry is deterministic; candy
+  // paths vary only through the seeded launch jitter, so the smoketest still reproduces.
+  pegs: {
+    enabled: false,          // OFF — flip to true to re-enable the funnel pegs + ASMR pachinko ticks
+    // rows of pins as fractions of the drawn box; each row auto-spreads `count` pins across the
+    // cavity width at its y (which narrows toward the chute), inset from the slants. Alternate rows
+    // are half-phase offset (true pachinko) so a candy off one pin drops between the next two.
+    rows: [
+      { yFrac: 0.700, count: 3 },
+      { yFrac: 0.742, count: 4 },
+      { yFrac: 0.783, count: 3 },
+    ],
+    radiusFrac: 0.015,       // pin radius as a frac of box width
+    insetFrac: 0.032,        // keep pins this far inside the cavity edges (frac of box width)
+    // collision feel — the pins are RIGID like the walls: bounce uses the candy's OWN restitution,
+    // floored/capped so even a dead jelly still gives a couple of lively ticks.
+    minE: 0.34, maxE: 0.62, bounceMul: 1.15,
+    frictionMul: 0.35,       // light tangential grip (smooth moulded pin)
+    spinKick: 5.0,           // erratic spin a non-roller picks up off a pin (× seeded noise)
+    hitMinSpeed: 26,         // normal approach speed (px/s) below which a graze is silent
+    speedRef: 900,           // approach speed (px/s) mapped to a "full" hit (loudness / brightness)
+  },
 };
 
 // ---- LEVEL DEFINITION -------------------------------------------------------

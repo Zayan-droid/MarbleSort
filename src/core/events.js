@@ -40,6 +40,7 @@ export const EV = {
   MARBLE_SEAT: 'marble:seat',     // {x, y, color}  — a candy settled into a jar
   MOVE_INVALID: 'move:invalid',   // {x, y}  — a rejected move (wrong jar / full tray)
   BOX_CLEAR: 'box:clear',         // {x, y, color}  — a jar completed
+  PEG_HIT: 'peg:hit',             // {x, y, note01, speed01, pan, color, pegIndex} — candy struck a funnel pin
   DIAL_DETENT: 'dial:detent',     // {speed}
   DIAL_SPIN: 'dial:spin',         // {speed}  (continuous; emitted each frame)
   JAM_WARNING: 'jam:warning',     // {count}
