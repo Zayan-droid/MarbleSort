@@ -72,6 +72,10 @@ export class DispenserPhysics {
     // The TRAY BASIN below the chute (absolute px: inner walls + floor). Set by PuzzleGame.resize
     // once the center box is known; candies that fall past the chute exit pile against it.
     this.basin = null;
+    // OVERFLOW GATE (absolute px y). Set by PuzzleGame.resize from DISPENSER.gate. A candy flagged
+    // `admitted === false` (a WAITING candy, tray full) cannot descend past this line — it rests on
+    // it and PILES above it in the funnel. Admitted candies ignore the gate and fall on into the tray.
+    this.gateY = null;
   }
 
   // Bind freshly-computed colliders + scale speeds/sizes to the current dispenser width.
@@ -122,8 +126,9 @@ export class DispenserPhysics {
       c._contact = false;
       c.angle += c.spin * h;
       advanceWobble(c, h);   // decay/oscillate any soft-body deformation
-      // anti-stuck backup (only while still IN the dispenser): nudge a loitering candy chute-ward
-      if (c.y < C.exitY && now - c.bornAt > this.cfg.stuckMs) {
+      // anti-stuck backup (only while still IN the dispenser): nudge a loitering candy chute-ward.
+      // SKIP candies waiting at the gate (admitted === false) — they're held there ON PURPOSE.
+      if (c.admitted !== false && c.y < C.exitY && now - c.bornAt > this.cfg.stuckMs) {
         c.vx += sign(C.cx - c.x) * this.burst * 0.6 * h * 8;
         c.vy += this.g * 0.5 * h;
       }
@@ -143,6 +148,9 @@ export class DispenserPhysics {
         for (let k = 0; k < this._resting.length; k++) this._pileContact(transit[i], this._resting[k], wakeSp);
       }
     }
+    // RIGHTING pass — after all contacts this substep, ease each candy toward its upright rest angle
+    // (gentle while falling fast, firm as it settles) so it lands in its canonical spritesheet pose.
+    for (let i = 0; i < transit.length; i++) this._right(transit[i], h);
   }
 
   // A dropped (transit) candy `c` against a RESTING pile candy `o` (item 4). The resting candy holds
@@ -183,6 +191,17 @@ export class DispenserPhysics {
     // SHAPE-AWARE half-extents (item 3): rx bounds the vertical walls, ry the floor/top; the diagonal
     // slants use the mean (their contact is oblique). Fall back to the circular radius when off.
     const rx = c.rx || r, ry = c.ry || r, rm = (rx + ry) * 0.5;
+    // OVERFLOW GATE: a WAITING candy (admitted === false, tray full) can't pass the gate line — it
+    // rests on it; the band logic below still bounds its x against the funnel walls, so waiting candies
+    // PILE in the funnel above the gate (and on one another via _pair) instead of entering the tray.
+    // Admitted candies (the normal flow) have admitted !== false, so they fall straight through.
+    if (this.gateY != null && c.admitted === false && c.y > this.gateY - ry) {
+      c.y = this.gateY - ry;
+      if (c.vy > 0) { this._impact(c, c.vy, 0, -1); c.vy = -c.vy * e; }   // soft-body squash on the gate
+      const decel = this._fr(c) * this.cfg.floorFrictionMul * this.g * h;  // Coulomb friction → settles ON it
+      if (Math.abs(c.vx) <= decel) c.vx = 0; else c.vx -= sign(c.vx) * decel;
+      this._floorRoll(c, rm);
+    }
     if (c.y < C.funnelTopY) {
       // inside the rectangle: side + top walls
       if (c.x < C.innerRect.left + rx) { c.x = C.innerRect.left + rx; if (c.vx < 0) { this._impact(c, -c.vx, 1, 0); c.vx = -c.vx * e; c.vy *= (1 - wfr); this._wallRoll(c, 'left', rm); } }
@@ -206,37 +225,46 @@ export class DispenserPhysics {
       if (c.x < B.left + rx) { c.x = B.left + rx; if (c.vx < 0) { this._impact(c, -c.vx, 1, 0); c.vx = -c.vx * e; c.vy *= (1 - wfr); this._wallRoll(c, 'left', rm); } }
       else if (c.x > B.right - rx) { c.x = B.right - rx; if (c.vx > 0) { this._impact(c, c.vx, -1, 0); c.vx = -c.vx * e; c.vy *= (1 - wfr); this._wallRoll(c, 'right', rm); } }
       if (c.y > B.floor - ry) {
-        const impact = c.vy;
         c.y = B.floor - ry;
-        if (c.vy > 0) { this._impact(c, c.vy, 0, -1); c.vy = -c.vy * e; }  // soft-body squashes on the floor
+        if (c.vy > 0) { this._impact(c, c.vy, 0, -1); c.vy = -c.vy * e; }  // soft-body squashes + rocks on the floor
         // COULOMB friction along the floor: a CONSTANT deceleration μ·g opposing horizontal motion
         // (real kinetic friction, not a multiplier) — a slippery hard candy slides far, a tacky
         // gummy / soft slab stops almost at once.
         const decel = this._fr(c) * this.cfg.floorFrictionMul * this.g * h;
         if (Math.abs(c.vx) <= decel) c.vx = 0; else c.vx -= sign(c.vx) * decel;
         this._floorRoll(c, rm);
-        this._settleAngle(c, h, impact);   // shape-aware rest: snap flat / rock on a point (item 3)
       }
     }
   }
 
-  // SHAPE-AWARE SETTLE (item 3): nudge a resting candy's orientation toward its shape's stable angle.
-  // A 'snap' cube drives hard+damped to the nearest flat face (sits square); a 'flat' bean/pill lies
-  // on its long axis; a 'wobble' diamond drives toward the nearest edge with LOW damping (so it ROCKS
-  // on its point a few times) and gets a small angular KICK on a firm landing. 'roll' shapes are left
-  // to keep rolling. Deterministic; purely an orientation effect (no position/logic change).
-  _settleAngle(c, h, impact) {
+  // RIGHTING (run every substep for every transit candy): ease the candy toward its canonical UPRIGHT
+  // orientation (its `restBase` — 0 for most, +90° for the lollipop) so it comes to REST exactly as
+  // drawn in the spritesheet. Strength ramps with how SETTLED it is — none while it tumbles/rolls down
+  // fast, full as it slows to rest — and it turns by the SHORTEST path to the nearest equivalent of the
+  // target, so the correction is spread across the slow part of the fall and never reads as a snap.
+  // Purely an orientation effect (no position/logic change) so the headless smoketest is unaffected.
+  _right(c, h) {
+    const R = this.cfg.righting;
+    if (!R || !R.enabled) return;
+    const speed = Math.hypot(c.vx, c.vy);
+    const s = clamp(1 - speed / Math.max(1, R.speedFrac * this._vref), 0, 1);
+    if (s <= 0) return;
+    const target = c.restBase || 0;
+    let d = (target - (c.angle || 0)) % (2 * Math.PI);     // shortest signed turn to the nearest
+    if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI;  // equivalent of target
+    c.angle = (c.angle || 0) + d * Math.min(1, R.rate * s * h);   // ease toward upright
+    c.spin *= Math.max(0, 1 - s * (R.spinBleed || 8) * h);        // bleed the tumble so it doesn't fight
+  }
+
+  // A 'wobble' candy gets a rotational ROCK kick on a firm contact (landing on the floor or striking
+  // the pile), scaled by the impact speed `sp`. Direction is deterministic (its current spin, else its
+  // horizontal motion, else seeded noise) so a straight drop still tips a repeatable way.
+  _rockKick(c, sp) {
     const S = this.cfg.shape;
-    if (!S || !S.enabled || !c.settle || c.settle === 'roll') return;
-    const half = Math.PI / 2, base = c.restBase || 0;
-    const step = c.settle === 'flat' ? Math.PI : half;   // flat shapes are 180°-symmetric
-    const target = Math.round((c.angle - base) / step) * step + base;
-    const damp = c.settle === 'wobble' ? S.angDampWobble : S.angDampFlat;
-    if (c.settle === 'wobble' && impact > this._vref * 0.12) {
-      c.spin += sign(c.spin || c.vx || 1) * S.landKick * (impact / this._vref); // tip it off its point
-    }
-    c.spin += (target - c.angle) * S.angStiffness * h;   // restoring torque toward the rest angle
-    c.spin *= Math.max(0, 1 - damp * h);                 // damping: low for wobble → rocks; high → holds
+    if (!S || !S.enabled || c.settle !== 'wobble' || sp <= this._vref * 0.05) return;
+    const k = S.landKick * Math.min(1.5, sp / this._vref);
+    const dir = sign(c.spin) || sign(c.vx) || sign(this._noise(c)) || 1;
+    c.spin = (c.spin || 0) + dir * k;
   }
 
   // Push a candy onto a slant line and reflect its velocity about the slant normal so it SLIDES
@@ -310,6 +338,9 @@ export class DispenserPhysics {
       // soft candies squash where they press into each other (no bump kick — keeps the pile stable)
       this._squash(a, -vn, -nx, -ny);
       this._squash(b, -vn, nx, ny);
+      // a 'wobble' candy also ROCKS when it strikes the pile (a bit less than a floor landing)
+      this._rockKick(a, -vn * 0.6);
+      this._rockKick(b, -vn * 0.6);
     }
   }
 
@@ -328,6 +359,7 @@ export class DispenserPhysics {
   // firm contacts so a candy still comes to rest (no perpetual jitter).
   _impact(c, sp, nx, ny) {
     this._squash(c, sp, nx, ny);
+    this._rockKick(c, sp);   // a 'wobble' candy turns on a firm impact
     if (c.bump && sp > this._vref * 0.18) {
       const n1 = this._noise(c), n2 = this._noise(c);   // deterministic per-candy (no Math.random)
       const tx = -ny, ty = nx;                          // along the surface

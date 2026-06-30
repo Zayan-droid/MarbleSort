@@ -2,9 +2,9 @@
 //
 // Warns (does not throw) so a level author notices a malformed / unwinnable build, mirroring
 // the conveyor's validatePacketBalance style. Rules (from the design spec):
-//   * packet (supply group) count is 3..15
-//   * every packet supplies at least 1 candy (count is just per-color supply now — the rack
-//     flattens packets into individual candies, so it no longer has to equal the tray capacity)
+//   * packet TRAY count is 3..32 (each tray is a small mono-color batch that BURSTS on a tap, so a
+//     level has more, smaller packets than the old one-big-supply-group model)
+//   * every packet supplies at least 1 candy
 //   * center container capacity === 6
 //   * total packet candies per color === total jar capacity per color (winnable)
 
@@ -20,7 +20,7 @@ export function validateLevel(level) {
   const jars = (level && level.jars) || [];
 
   if (packets.length < 3) flag(`only ${packets.length} packets (minimum 3)`);
-  if (packets.length > 15) flag(`${packets.length} packets (maximum 15)`);
+  if (packets.length > 32) flag(`${packets.length} packets (maximum 32)`);
 
   for (const p of packets) {
     const c = p.count != null ? p.count : CENTER.capacity;

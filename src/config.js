@@ -1,44 +1,137 @@
 // config.js — ALL tunable constants live here.
 // Tweak feel, difficulty, colors, audio levels, and haptic intensities in one place.
 
-export const COLORS = {
-  // Candy palette (bright, glossy). The renderer blits each type from the candy spritesheet
-  // (`newcandy/newcandies.png`, a non-uniform collage), so each color carries `spriteRect:
-  // [x,y,w,h]` — the candy's PIXEL bounding box in that sheet (measured from the art). The blit
-  // fits that rect, aspect-preserved, into the candy's draw box, and is used EVERYWHERE a candy
-  // is drawn (packet tiles, the spilled/piling balls, jar contents, the jar target indicator).
-  // `base/light/dark` still tint particle bursts + the procedural fallback (drawn only until the
-  // sheet loads); `shape` is that fallback's silhouette. `art`/`groove` feed the DORMANT tray code.
-  // physics: real material behaviour for the funnel/tray sim. Common: restitution (bounce), friction
-  // (slide/grip), mass (momentum + air drag), roll (does it spin like a disc). Soft-body extras:
-  //   jiggle     — how much the candy DEFORMS per impact (0 = rigid)
-  //   wobbleFreq — oscillation rate of an ELASTIC jiggle (rad/s); 0 = no oscillation (plastic squash)
-  //   wobbleDamp — how fast a deformation settles back (per s); low = wobbles long, high = soft/quick
-  //   bump       — surface unevenness: lateral + angular KICK on each firm contact (0 = smooth)
-  //   airDrag    — extra air resistance (1 = normal; >1 = floaty, falls slower)
-  // red = STRICT JELLY (gelatin): does NOT roll like a disc — it deforms, barely bounces (energy
-  // goes into the wobble, not rebound), grips where it lands (high friction → translation dies fast),
-  // and QUIVERS — a big, fast, lightly-damped jiggle that keeps oscillating for a moment after it
-  // rests. A little surface unevenness (low `bump`) gives an irregular settle, not a clean spin.
-  red:    { base: '#f0524f', light: '#ff9b97', dark: '#9e2b2c', shape: 'round',   spriteRect: [64, 1082, 107, 106], art: 'red',    groove: { w: 0.60, h: 0.215 }, physics: { material: 'jelly', restitution: 0.12, friction: 0.64, mass: 1.20, roll: false, jiggle: 0.55, wobbleFreq: 34, wobbleDamp: 4.2, bump: 0.22, airDrag: 1.0 } },
-  amber:  { base: '#f7b53d', light: '#ffd79a', dark: '#a06a14', shape: 'oval',    spriteRect: [59, 625, 126, 123],  art: 'mango',  groove: { w: 0.60, h: 0.26 },  physics: { material: 'hard',  restitution: 0.48, friction: 0.10, mass: 0.85, roll: true,  jiggle: 0,    wobbleFreq: 0,  wobbleDamp: 0,   bump: 0,    airDrag: 1.0 } },
-  green:  { base: '#5fc878', light: '#bdf0c4', dark: '#2f6b40', shape: 'square',  spriteRect: [55, 289, 122, 121],  art: 'green',  groove: { w: 0.46, h: 0.205 }, physics: { material: 'hard',  restitution: 0.48, friction: 0.10, mass: 0.85, roll: true,  jiggle: 0,    wobbleFreq: 0,  wobbleDamp: 0,   bump: 0,    airDrag: 1.0 } },
-  // blue = FLUFFY SPONGE CAKE: not jelly, not rubber. On impact it COMPRESSES first and ABSORBS the
-  // hit (tiny rebound, restitution ~0.15 — a candy landing on it is caught softly, energy sinks into
-  // the foam), RECOVERS slowly with only 1–2 small damped jiggles (high `wobbleDamp`, modest freq),
-  // and SETTLES. Squash is gentle (8–18%, `squashMax`); medium-high friction so candies don't skate;
-  // light + floaty descent (high `airDrag`) like air-filled sponge.
-  blue:   { base: '#5aa6f5', light: '#a9d2ff', dark: '#26568f', shape: 'pill',    spriteRect: [1107, 294, 95, 90],  art: 'blue',   groove: { w: 0.66, h: 0.180 }, physics: { material: 'cake',  restitution: 0.15, friction: 0.72, mass: 0.55, roll: false, jiggle: 0.5,  wobbleFreq: 26, wobbleDamp: 7.0, bump: 0,    airDrag: 2.4, squashMax: 0.18 } },
-  purple: { base: '#b274f0', light: '#dcc2ff', dark: '#5d3b8f', shape: 'diamond', spriteRect: [211, 298, 120, 97],  art: 'purple', groove: { w: 0.56, h: 0.220 }, physics: { material: 'hard',  restitution: 0.55, friction: 0.06, mass: 1.05, roll: true,  jiggle: 0,    wobbleFreq: 0,  wobbleDamp: 0,   bump: 0,    airDrag: 1.0 } },
+const _clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+// ---- CANDY PHYSICS PROFILES (data-driven) -------------------------------------------------------
+// THE single source of truth for how each candy MOVES. One profile per candy type; every value is a
+// readable "feel" knob (mostly 0..1 tendencies, plus absolute mass/restitution). `physicsFromProfile`
+// below ADAPTS each profile into the low-level fields the funnel/tray sim already consumes — so to
+// re-tune a candy you edit ONLY its profile here. Profiles drive the packet burst, the dispenser
+// funnel tumble, the holding-tray settle, and the center→jar pour (see puzzle.js / dispenser.js).
+//
+// Fields (CandyPhysicsProfile):
+//   candyType        — label
+//   collisionRadius  — ×base radius (irregular candies a touch larger so they jostle)
+//   visualBounds     — {wx,hy} coarse ELLIPSE half-extents (×radius): the shape approximation used
+//                      for packing/settle (oval bean, wide wrapper, tall lollipop) — NOT polygons
+//   mass             — relative; heavier ⇒ bursts less, shoves more, floats less
+//   friction         — 0..1 grip on surfaces (sticky/soft high, glossy low)
+//   restitution      — 0..1 bounce (hard candies higher, soft candies near zero)
+//   damping          — 0..1 how fast motion + wobble bleed away (soft/sticky high → stops/settles fast)
+//   rollTendency     — 0..1; ≥0.5 the candy ROLLS (spin couples to surface speed)
+//   slideTendency    — 0..1 how readily it skates flat (informational + light grip relief)
+//   wobbleAmount     — 0..1 elastic jiggle/quiver after a hit (jelly/wrapper/lollipop high)
+//   spinAmount       — 0..1 launch + landing spin (asymmetric candies high → tumble awkwardly)
+//   squashAmount     — 0..1 soft-body compression on impact (marshmallow/gummy high; hard = 0)
+//   settleTime       — relative time to come to rest (informational; feeds damping feel)
+//   settle           — rest behaviour: 'roll' | 'flat' (lie on long axis) | 'snap' (cube to a face)
+//                      | 'wobble' (rock a few times then settle)
+//   restBase         — preferred rest orientation (rad) for flat/snap/wobble settles
+//   material         — landing-clink timbre: 'hard' (bright) | 'jelly' | 'soft' (dull)
+export const CANDY_PROFILES = {
+  // Red gummy bear — soft, sticky, uneven: barely bounces, grips, tumbles awkwardly, squashes, settles fast.
+  red:    { candyType: 'gummy_bear',   collisionRadius: 1.06, visualBounds: { wx: 1.02, hy: 1.06 }, mass: 1.20, friction: 0.85, restitution: 0.12, damping: 0.80, rollTendency: 0.10, slideTendency: 0.20, wobbleAmount: 0.85, spinAmount: 0.18, squashAmount: 0.55, settleTime: 0.50, settle: 'wobble', restBase: 0,      material: 'jelly' },
+  // Blue jelly bean — smooth glossy oval: rolls + slides, medium bounce, low wobble, small final roll.
+  blue:   { candyType: 'jelly_bean',   collisionRadius: 1.00, visualBounds: { wx: 1.14, hy: 0.78 }, mass: 0.80, friction: 0.18, restitution: 0.50, damping: 0.40, rollTendency: 0.90, slideTendency: 0.85, wobbleAmount: 0.10, spinAmount: 0.35, squashAmount: 0.00, settleTime: 0.80, settle: 'roll',   restBase: 0,      material: 'hard'  },
+  // Green jelly dome — sugary dome: flatter base, sticky surface, doesn't roll freely, wobbles on landing.
+  green:  { candyType: 'jelly_dome',   collisionRadius: 1.02, visualBounds: { wx: 1.08, hy: 0.92 }, mass: 0.95, friction: 0.60, restitution: 0.28, damping: 0.60, rollTendency: 0.25, slideTendency: 0.35, wobbleAmount: 0.85, spinAmount: 0.10, squashAmount: 0.40, settleTime: 0.70, settle: 'wobble', restBase: 0,      material: 'jelly' },
+  // Yellow spiral disk — hard flat candy: rolls strongly on edge, can slide flat, clicky, low deform.
+  yellow: { candyType: 'spiral_disk',  collisionRadius: 1.00, visualBounds: { wx: 1.00, hy: 0.86 }, mass: 1.00, friction: 0.30, restitution: 0.46, damping: 0.40, rollTendency: 0.85, slideTendency: 0.60, wobbleAmount: 0.40, spinAmount: 0.45, squashAmount: 0.00, settleTime: 0.80, settle: 'roll',   restBase: 0,      material: 'hard'  },
+  // Pink marshmallow — very soft + light: absorbs impact, almost no bounce, squashes + puffs back, floaty.
+  pink:   { candyType: 'marshmallow',  collisionRadius: 1.04, visualBounds: { wx: 1.00, hy: 0.92 }, mass: 0.50, friction: 0.80, restitution: 0.08, damping: 0.95, rollTendency: 0.30, slideTendency: 0.30, wobbleAmount: 0.45, spinAmount: 0.10, squashAmount: 0.90, settleTime: 0.60, settle: 'flat',   restBase: 0,      material: 'soft'  },
+  // Orange caramel cube — heavy, blocky, sticky: doesn't roll, tumbles corner-to-corner, thuds, snaps flat.
+  orange: { candyType: 'caramel_cube', collisionRadius: 1.05, visualBounds: { wx: 0.96, hy: 0.96 }, mass: 1.35, friction: 0.60, restitution: 0.12, damping: 0.80, rollTendency: 0.05, slideTendency: 0.40, wobbleAmount: 0.15, spinAmount: 0.05, squashAmount: 0.05, settleTime: 0.50, settle: 'snap',   restBase: 0,      material: 'soft'  },
+  // Purple wrapped candy — round centre, wrapper wings: tumbles unpredictably, spins + wobbles, playful.
+  purple: { candyType: 'wrapped',      collisionRadius: 1.08, visualBounds: { wx: 1.20, hy: 0.82 }, mass: 1.00, friction: 0.30, restitution: 0.45, damping: 0.45, rollTendency: 0.50, slideTendency: 0.50, wobbleAmount: 0.85, spinAmount: 0.85, squashAmount: 0.00, settleTime: 0.90, settle: 'wobble', restBase: 0,      material: 'hard'  },
+  // Cyan lollipop — round hard head + stick: asymmetric, pivots/rotates awkwardly, won't roll cleanly.
+  // restBase = +90° (π/2): it RESTS rotated a quarter-turn right from the spritesheet orientation
+  // (stick pointing sideways) — the funnel righting eases it there during the fall so it isn't a snap.
+  cyan:   { candyType: 'lollipop',     collisionRadius: 1.00, visualBounds: { wx: 1.00, hy: 1.05 }, mass: 0.90, friction: 0.35, restitution: 0.45, damping: 0.50, rollTendency: 0.40, slideTendency: 0.40, wobbleAmount: 0.80, spinAmount: 0.80, squashAmount: 0.00, settleTime: 0.90, settle: 'wobble', restBase: 1.5708, material: 'hard'  },
 };
 
-// Default candy material if a color omits `physics` (a neutral, mildly bouncy rigid candy).
-export const CANDY_PHYSICS_DEFAULT = { material: 'hard', restitution: 0.35, friction: 0.18, mass: 1.0, roll: true, jiggle: 0, wobbleFreq: 0, wobbleDamp: 0, bump: 0, airDrag: 1.0 };
+// ADAPTER: a readable CandyPhysicsProfile → the low-level fields the sim consumes (so dispenser.js /
+// puzzle.js stay unchanged). restitution/friction/mass pass through; the tendencies map onto the
+// soft-body + roll knobs. `crMul`/`wx`/`hy`/`settle`/`restBase`/`spin`/`slide` are read by
+// onPacketTapped when it stamps a freshly-dispensed candy.
+export function physicsFromProfile(p) {
+  const roll = p.rollTendency >= 0.5;
+  const wob = p.wobbleAmount || 0;
+  const sq = p.squashAmount || 0;
+  return {
+    material: p.material || (sq > 0.6 ? 'soft' : roll ? 'hard' : 'jelly'),
+    restitution: p.restitution,
+    friction: p.friction,
+    mass: p.mass,
+    roll,
+    // deformation magnitude per impact (squash dominates; a wobbly candy deforms a little too)
+    jiggle: _clamp(Math.max(sq, wob * 0.65), 0, 1),
+    // only wobbly candies OSCILLATE (elastic quiver); rate rises with wobbleAmount
+    wobbleFreq: wob > 0.05 ? 20 + wob * 22 : 0,
+    // how fast the jiggle settles back — driven by HOW WOBBLY the candy is, NOT its translational
+    // grip: a high-wobble JELLY (red/dome) quivers a long time (LOW damp); a low-wobble or squashy
+    // candy (cube / marshmallow) calms in 1–2 jiggles (HIGH damp). 0.85→4.4, 0.55→7.0, 0.1→11.1.
+    wobbleDamp: _clamp(3.2 + (1 - wob) * 8.8, 3.2, 12),
+    // surface unevenness → erratic tumble: spinny/irregular non-rollers scatter most
+    bump: _clamp((p.spinAmount || 0) * 0.22 + (1 - p.rollTendency) * wob * 0.12, 0, 0.3),
+    // air resistance ~ FOAMINESS (lightness): only genuinely LIGHT candies (marshmallow, sponge cake)
+    // drift down slowly; dense candies fall at normal speed. A heavy/sticky candy grips on CONTACT
+    // (that's friction) but must NOT float in the air — tying this to `damping` made the gummy bear /
+    // jelly dome hang in the funnel, so it's driven by low mass instead. mass≥0.78 ⇒ airDrag 1 (normal).
+    // Multiplier eased 3→2 so pink (the only mass<0.78 candy, at 0.50) keeps a soft float (≈1.56)
+    // without crawling down the funnel — it was the slowest candy to reach the tray.
+    airDrag: _clamp(1 + Math.max(0, 0.78 - (p.mass || 1)) * 2, 1, 2.4),
+    // cap soft-body compression (undefined ⇒ sim's global cap) — only soft candies squash
+    squashMax: sq > 0 ? 0.06 + sq * 0.16 : undefined,
+    // ---- read by onPacketTapped when stamping the spilled candy ----
+    crMul: p.collisionRadius || 1,
+    wx: (p.visualBounds && p.visualBounds.wx) || 1,
+    hy: (p.visualBounds && p.visualBounds.hy) || 1,
+    settle: p.settle || 'roll',
+    restBase: p.restBase || 0,
+    spin: p.spinAmount || 0,
+    slide: p.slideTendency || 0,
+  };
+}
 
-// Friendly color names from level data that map onto a real COLORS key (so a level can
-// say `yellow` and reuse amber's art). resolveColor() in traySlots.js / state.js applies it.
+// Per-color visual + the sim physics built from each profile. The renderer blits each candy from the
+// spritesheet (`candy_spritesheet_final_1.png`, a clean 4×2 grid): `sprite:[col,row]` is its cell and
+// `spriteRect:[x,y,w,h]` the cell's pixel box (the loader chroma-keys the green/black cell backgrounds
+// to transparent, then measures each candy's tight content). The SAME blit draws packet tiles, the
+// spilled/piling balls and jar contents. `base/light/dark` tint particle bursts + the procedural
+// fallback (only until the sheet loads); `shape` is that fallback's silhouette. `art` keys the
+// per-color CandyTrayPackets tile art. `physics` is the adapted profile (see physicsFromProfile).
+const SHEET_COLS = 4, SHEET_ROWS = 2, CELL_W = 256, CELL_H = 253;
+const CANDY_DEFS = {
+  red:    { sprite: [0, 0], shape: 'round',   base: '#e8413f', light: '#ff928e', dark: '#9e2b2c', art: 'red'    },
+  blue:   { sprite: [1, 0], shape: 'oval',    base: '#3f74e0', light: '#8fb4ff', dark: '#1f3f87', art: 'blue'   },
+  green:  { sprite: [2, 0], shape: 'round',   base: '#4faf43', light: '#9fe07f', dark: '#2c6b2a', art: 'green'  },
+  yellow: { sprite: [3, 0], shape: 'round',   base: '#f4b81e', light: '#ffe07a', dark: '#a06a14', art: 'yellow' },
+  pink:   { sprite: [0, 1], shape: 'pill',    base: '#f29ec6', light: '#ffd0e6', dark: '#b25f8e', art: 'pink'   },
+  orange: { sprite: [1, 1], shape: 'square',  base: '#f0922e', light: '#ffc481', dark: '#a85e14', art: 'mango'  },
+  purple: { sprite: [2, 1], shape: 'diamond', base: '#9b54d8', light: '#cfa2f0', dark: '#5d3b8f', art: 'purple' },
+  cyan:   { sprite: [3, 1], shape: 'round',   base: '#3fc6d8', light: '#a2eef5', dark: '#1f7f8f', art: 'cyan'   },
+};
+export const COLORS = {};
+for (const _k in CANDY_DEFS) {
+  const d = CANDY_DEFS[_k];
+  const p = CANDY_PROFILES[_k];
+  COLORS[_k] = {
+    base: d.base, light: d.light, dark: d.dark, shape: d.shape, art: d.art,
+    sprite: d.sprite,
+    spriteRect: [d.sprite[0] * CELL_W, d.sprite[1] * CELL_H, CELL_W, CELL_H],
+    profile: p,
+    physics: physicsFromProfile(p),
+  };
+}
+
+// Default candy material if a color omits `physics` (a neutral, mildly bouncy rigid candy).
+export const CANDY_PHYSICS_DEFAULT = { material: 'hard', restitution: 0.35, friction: 0.18, mass: 1.0, roll: true, jiggle: 0, wobbleFreq: 0, wobbleDamp: 0, bump: 0, airDrag: 1.0, crMul: 1, wx: 1, hy: 1, settle: 'roll', restBase: 0, spin: 0, slide: 0.3 };
+
+// Friendly color names from level data that map onto a real COLORS key. `amber` (the old yellow
+// candy's key) now resolves to the yellow spiral disk. resolveColor() in traySlots.js applies it.
 export const COLOR_ALIASES = {
-  yellow: 'amber',
+  amber: 'yellow',
 };
 
 export const THEME = {
@@ -179,6 +272,8 @@ export const PACKET = {
   // TIME (a short stream, driven by state._time); the emptied packet is then replaced by the
   // next queued packet. Tapping a packet is disabled while it is releasing.
   slotCount: 9,            // default number of top packet slots SHOWN (a level may override via packetSlots)
+  packetSize: 3,           // ACTIVE puzzle: candies in one packet TRAY — a tap BURSTS this whole batch
+                           // down the funnel (fallback when a level's packet omits `count`)
   releaseIntervalMs: 120,  // gap between streamed candies while a tapped packet empties
   autoChunk: 6,            // fallback only: candies per auto-derived packet when a level omits topPacketQueue
   // feeder-grid layout (all sizes scale with the smaller screen dimension, px floors):
@@ -311,9 +406,11 @@ export const CENTER = {
   // pile lifting and resetting. Bounded by the center capacity (≤6 bodies) so the contacts are nearly
   // free. Toggle `enabled` (false = the old revive-the-whole-pile behaviour).
   pile: {
-    enabled: false,         // DORMANT — out of the requested scope (items 1+2). The proven reflow
-                            // path runs instead; enable + run smoketest (partB/J count invariants)
-                            // before shipping, since this re-routes how a drop onto a pile is counted.
+    enabled: true,          // ON — a drop (a burst OR a gate-admitted overflow candy) lands on the
+                            // RESTING pile, which stays exactly put; only the neighbours it strikes hard
+                            // enough WAKE + re-settle. This replaces the old whole-pile REFLOW (which
+                            // lifted the entire settled pile back into the sim and visibly jolted it),
+                            // so admitted overflow candies glide in WITHOUT disturbing the pile.
     wakeSpeedFracH: 0.085,  // a resting candy WAKES only if a strike gives it more than this (×box height/s)
     push: 0.45,             // how much a resting candy yields to the dropped candy on contact (0..1)
   },
@@ -324,11 +421,12 @@ export const CENTER = {
   // over capacity ROLLS BACK OUT to the rack with a reject cue — instead of a hard pre-block. Toggle
   // `enabled` (false = the old strict pipeline cap).
   overfill: {
-    enabled: false,       // DORMANT — out of the requested scope (items 1+2). Raising the cap past
-                          // capacity breaks the strict-pipeline regression test (smoketest partC),
-                          // which encodes the shipped "tray never overflows" design. Flip on +
-                          // update partC's expectation together if you want the jumble-then-rollback.
-    margin: 2,            // how far the pipeline (falling + in-tray) may exceed capacity before a tap is refused
+    enabled: false,       // OFF — SUPERSEDED by the DISPENSER.gate overflow buffer: a drop past the
+                          // tray's capacity now PILES at the chute gate and waits to be admitted as the
+                          // tray frees, instead of rolling back out to the supply. (Kept for the dormant
+                          // roll-back path; flip on only if you want the old reject-to-rack behaviour.)
+    margin: 3,            // how far the pipeline (falling + in-tray) may exceed capacity before a tap is
+                          // refused — one packet's worth, so a burst is never hard-blocked mid-tray
     riseFrac: 0.55,       // how far a rejected candy floats back up (frac of the tray box height) as it rolls out
     fadeMs: 460,          // roll-back-out animation length (ms)
   },
@@ -366,7 +464,7 @@ export const JAR = {
     vGapFrac: 0.03,       // gap between stacked jars as a frac of the area height
     previewScale: 0.8,    // preview jars are this fraction of the active jar's size
     previewAlpha: 0.6,    // and faded to this alpha (still readable)
-    slideTauMs: 110,      // smoothing time-constant for jars sliding forward on a shift
+    slideTauMs: 80,       // smoothing time-constant for jars sliding forward on a shift (snappier shift)
   },
   // The clear glass bowl of the open-jar frame where candies (and the target indicator) sit, as
   // fractions of the jar box (cx/cy = center, w/h = size). Re-tune if the jar art changes.
@@ -380,9 +478,11 @@ export const JAR = {
     open: { x: 0.0039, y: 0.2012, w: 0.1309, h: 0.2197 }, // empty open jar — the INITIAL look
     lid:  { x: 0.0234, y: 0.0430, w: 0.1367, h: 0.1006 }, // the lid alone — drops on to close
   },
-  // closing animation when a jar fills: the lid drops on, holds, then the sealed jar fades away
-  // and the jar is REMOVED. Times are ms off the dt-accumulated clock (jar._clearStart).
-  close: { lidDropMs: 360, holdMs: 150, fadeMs: 340 },
+  // closing animation when a jar fills: the lid drops on, holds, then the sealed jar fades away and
+  // the jar is REMOVED (which advances the lane → gates the next same-lane pour). Times are ms off the
+  // dt-accumulated clock (jar._clearStart), scaled by the sweep tempo. Tightened (850→510 total) so
+  // the seal + lane advance don't stall a chain — still readable as a lid-drop + seal.
+  close: { lidDropMs: 230, holdMs: 80, fadeMs: 200 },
 };
 
 // Movement tweens (eased, off the dt-accumulated clock) — used for every move EXCEPT the
@@ -390,22 +490,28 @@ export const JAR = {
 export const ANIM = {
   fallDurMs: 360,         // (legacy) packet -> center fall, now only the chute -> slot handoff
   fallStaggerMs: 70,      // delay between successive candies of one packet
-  moveDurMs: 300,         // center -> jar / center -> tray
+  moveDurMs: 240,         // center -> jar / center -> tray (snappier re-pack of leftovers after a pour)
   returnDurMs: 320,       // tray -> center
   intakeDurMs: 480,       // (legacy) chute -> center handoff — candies now tumble in via physics
   returnPackDurMs: 360,   // tray -> center: glide a retrieved group into its packed row
   bounce: 0.16,           // settle-bounce amplitude on arrival
-  autoRouteDelayMs: 240,  // CASCADE rhythm: the beat between successive pours once a sweep is running
+  autoRouteDelayMs: 130,  // CASCADE rhythm: the beat between successive pours once a sweep is running
                           // (it also shrinks with the sweep tempo). NOT used for the first route.
+                          // Tightened (240→130) so chain reactions read fast without losing the beat.
   firstRouteDelayMs: 0,   // the FIRST route of a freshly-settled candy fires (near) immediately — as
                           // soon as it's in the tray and a matching jar is active, it flows in, no wait
+  loseRevealMs: 6500,     // STUCK GRACE: once the board is unwinnable (tray FULL + no tray candy fits any
+                          // active jar) hold this long before showing the lose screen, so the player sees
+                          // the dead board and accepts the defeat. Cancelled if the stuck state clears.
   // POUR: candies don't glide straight to a jar — the holding tray TIPS toward the target jar and
   // the matching candies roll over its lip and arc down in (a lip-then-drop quadratic Bézier; see
   // puzzle.js _pourCandies / candyScreenPos). One jar is poured at a time so the tray tilts a single
   // direction. Cosmetic + deterministic (driven off _time), so the headless smoketest is unaffected.
   pour: {
-    durMs: 540,        // travel time tray -> jar (slower than a glide so the pour reads)
-    staggerMs: 95,     // gap between successive candies leaving (a one-by-one pouring stream)
+    durMs: 360,        // travel time tray -> jar (faster pour; still reads as a pour, not a glide).
+                       // This is the BASE for every jar incl. the FIRST, so lowering it speeds the
+                       // first jar too; chained jars scale it down further via POUR.speedup.
+    staggerMs: 60,     // gap between successive candies leaving (a quick one-by-one pouring stream)
     lipOutFrac: 0.12,  // how far past the tray lip (frac of tray WIDTH) the arc bulges toward the jar
     lipLiftFrac: 0.12, // how far the candy rises over the rim (frac of tray HEIGHT) before it drops
     spinTurns: 1.1,    // tumble (turns) a ROLLING candy makes during the pour; gummies/jelly don't spin
@@ -432,11 +538,14 @@ export const SCORING = {
     sparkleBoost: 0.6,    // extra burst scale when clutch
     hapticBoost: 0.4,     // extra haptic intensity when clutch
   },
-  // MULTIPLIER CANDY (Phase 2) — every Nth candy in the dealt rack queue is "special"; pays off
-  // ONLY when it lands a jar's FINAL slot. Deterministic (no Math.random) so smoketest reproduces.
+  // MULTIPLIER JAR (Phase 2) — each jar independently has a ~1-IN-6 chance of being a "×N" jar: it
+  // wears the gold glow + ×N badge, and COMPLETING it pays the multiplier. A level may also force a
+  // jar with `multiplier:true`. The pick is a SEEDED hash of the jar index (NOT Math.random), so the
+  // scatter LOOKS random yet is reproducible (the headless smoketest repeats); bump `seed` to reshuffle.
   multiplier: {
-    everyN: 7,            // flag every 7th candy in the flattened, interleaved rack queue
-    value: 2,            // score multiplier when a special candy completes a jar
+    chance: 1 / 6,       // per-jar probability of being a ×N jar (≈ 1 in 6)
+    seed: 0x1234,        // reshuffles the random scatter without changing the rate
+    value: 2,            // score multiplier when a multiplier JAR completes (the ×N shown on the badge)
     chimeBoost: 0.22,    // extra chime brightness on a multiplier completion (capped to that jar)
     sparkleBoost: 0.8,   // extra burst scale on a multiplier completion
   },
@@ -465,8 +574,12 @@ export const SCORING = {
 // first), never which jars are fillable. All numbers here.
 export const POUR = {
   angleDeg: 9,             // max tray tilt toward the lane being fed (deg) — cosmetic (~matches old feel)
-  easeTauMs: 90,           // ease toward an active pour target (smaller = snappier)
-  neutralReturnTauMs: 220, // ease back to level when no lane is being fed (slower = a gentle relax)
+  // The tilt must KEEP PACE with the (now faster) pours so the tray + the candies resting in it (both
+  // driven by the same _centerTilt → always in sync) visibly track the lane being fed. easeTau ≈ 70ms
+  // settles the tilt well within a 360ms pour, so it reads as the tray leaning into each pour, not
+  // lagging it; neutralReturn relaxes it to level a bit quicker once the cascade drains.
+  easeTauMs: 70,           // ease toward an active pour target (smaller = snappier)
+  neutralReturnTauMs: 150, // ease back to level when no lane is being fed (a gentle but prompt relax)
   slidePx: 6,              // optional nudge of routed-out candies toward the low edge (cosmetic)
   // ACCELERATION within a held sweep — works BOTH axes: consecutive completions DOWN a lane (vertical
   // chain) or ACROSS the front row (horizontal chain). Each consecutive completion in the cascade
@@ -474,11 +587,11 @@ export const POUR = {
   // (cascade count), FLOORED at minMul so it never blurs. 0.6 → a normal jar is 1×, the next in the
   // chain ≈0.6×, deeper jars ≈0.5× (the floor). The multiplier hits the pour, the fill, the close +
   // disappear, and the gap before the next pour, so the whole chained-jar cycle is ~0.6 of a lone jar's.
-  speedup: { factorPerLink: 0.6, minMul: 0.5 },
+  speedup: { factorPerLink: 0.6, minMul: 0.42 },
   perLaneReset: true,      // reset the VERTICAL chain counter (label only) when the pour lane changes
 };
 
-// ---- CANDY DISPENSER (the candy_dispenser.png packet rack + funnel physics) ----
+// ---- CANDY DISPENSER (the widecontainer.png packet rack + funnel physics) ----
 // The PNG is purely visual; these are the invisible colliders + physics tunables. ALL geometry
 // is expressed as FRACTIONS of the dispenser's DRAWN box (origin = box top-left), so it scales to
 // any screen size. Packets sit ONLY inside `innerRect`; tapping one spills its 6 candies, which
@@ -487,7 +600,7 @@ export const POUR = {
 // these fractions. This is a tiny self-contained sim — NOT a physics engine.
 export const DISPENSER = {
   // The dispenser box is sized DIRECTLY as a fraction of the screen and pinned to the top — it
-  // is the hero. candy_dispenser.png (1672×941, wide) is drawn to FILL this box, so it stretches to
+  // is the hero. widecontainer.png (1672×941, wide) is drawn to FILL this box, so it stretches to
   // fit; the colliders below are fractions of the box, so they stay aligned to the art either
   // way. (Hitting both targets at once is only possible by not preserving the art's aspect.)
   widthFrac: 0.96,         // box width as a frac of screen width (wider hero; capped to fit margins)
@@ -495,18 +608,29 @@ export const DISPENSER = {
                            // so the center+jars tail below the chute still fits — the jar area was
                            // trimmed to 0.26 of height to give this extra vertical room)
   // inner rectangle (the open mint/blue cavity) where the candy rack sits (frac of the drawn box).
-  // MEASURED from candy_dispenser.png's actual cavity (per-row alpha bbox, not eyeballed): the cavity
-  // walls hold ~0.125..0.873 from y≈0.15 down to where it starts narrowing (~0.55).
-  innerRect: { left: 0.13, right: 0.87, top: 0.15, bottom: 0.52 },
+  // MEASURED from widecontainer.png's actual cavity (per-row alpha bbox flood-fill, not eyeballed):
+  // the cavity walls hold ~0.125..0.873 from y≈0.15 down to where it starts narrowing (~0.52).
+  innerRect: { left: 0.125, right: 0.873, top: 0.15, bottom: 0.52 },
   // diagonal funnel: the cavity narrows from the rectangle's bottom corners to the chute mouth. The
-  // slant line was FIT to the measured cavity edges — a straight (0.13,0.55)→(0.462,0.82) on the left
-  // (and mirror on the right) tracks the painted slant within ~0.005 the whole way down.
-  funnel: { topY: 0.55, botY: 0.82 },
-  // central vertical chute (path) + the exit line where candies leave the dispenser. The measured
-  // chute mouth is ~0.462..0.534 (centre ≈0.498) — matching it keeps candies inside the visible spout.
-  // exitY: candies ride the chute walls down into the spout and only release into the center once they
-  // cross it, near the very bottom of the dispenser (the spout art runs to ~0.965).
-  path: { left: 0.462, right: 0.534, exitY: 0.94 },
+  // slant line was FIT to the measured cavity edges — a straight (0.125,0.52)→(0.404,0.80) on the left
+  // (and mirror on the right) tracks the painted slant within ~0.002 the whole way down (verified
+  // linear at the midpoint).
+  funnel: { topY: 0.52, botY: 0.80 },
+  // central vertical chute (path) + the exit line where candies leave the dispenser. widecontainer.png
+  // has a MUCH WIDER painted spout than the old art: ~0.404..0.595 (≈0.19 wide, centre ≈0.50) — about
+  // 2.6× the old 0.072, so ~3 candy-widths fit and candies no longer jam or ricochet between the walls.
+  // exitY: candies ride the chute down and release into the center once they cross it, right at the
+  // spout mouth (the spout interior bottoms out at ~0.831 in this art) — set AT the mouth so candies
+  // traverse the full visible spout, then pour out into the tray seated just below it (see puzzle.js).
+  path: { left: 0.404, right: 0.595, exitY: 0.83 },
+  // OVERFLOW GATE (the "black line" at the chute entrance). When the holding tray is FULL, candies
+  // tapped down anyway PILE UP above this line and are NOT allowed past it — they wait in the funnel.
+  // As soon as the tray frees a slot (auto-route empties it into a jar), the waiting candy NEAREST the
+  // entrance is admitted and tumbles in. `yFrac` is the line as a frac of the box HEIGHT (just above
+  // the chute throat at funnel.botY 0.80, so waiting candies never enter the chute). `queueMax` caps
+  // how many may pile at the gate before a further tap is refused (the funnel's holding capacity).
+  // See puzzle.js (_manageGate / this.waiting) + dispenser.js (the gate floor in _constrain).
+  gate: { enabled: true, yFrac: 0.78, queueMax: 9 },
   // CANDY RACK grid inside the inner rectangle: the dispenser is FILLED with individual candies
   // (rackCols × rackRows of them, SPANNING the whole inner rect) and ONE TAP drops ONE candy.
   // RESPONSIVE: resize() picks whichever grid in `rackGrids` makes the BIGGEST candies for the
@@ -535,36 +659,43 @@ export const DISPENSER = {
   packetPadFrac: 0.015,    // small padding inside the inner rectangle before the grid spans it
   packetMaxCols: 3,        // (legacy; the rack uses rackCols/rackRows)
   // physics tunables (lengths/speeds scale with the dispenser width at resize):
-  gravity: 1350,           // px/s^2 at the reference width (DISPENSER._refW) — LOW so candies drift
-                           // and TUMBLE down the funnel slowly, finding their way to the chute,
-                           // instead of snapping to the exit
+  gravity: 2050,           // px/s^2 at the reference width (DISPENSER._refW) — enough that candies
+                           // drop briskly from the rack into the tray (no long hang in the funnel)
+                           // while still tumbling readably down the slants on the way to the chute
   restitution: 0.42,       // bounce off slants / walls — a bit livelier so they jostle/tumble
   friction: 0.08,          // tangential energy lost sliding along a surface
   damping: 0.012,          // per-second velocity bleed (settling)
   burstSpeed: 70,          // initial outward spill speed (px/s at reference width) — a gentle pop
                            // that SPREADS the candies across the packet so they tumble independently
   burstSpreadFrac: 0.5,    // horizontal spread of the burst within a packet tile
-  substeps: 6,             // physics sub-steps per frame (stability through the narrow chute)
+  substeps: 10,            // physics sub-steps per frame — HIGH so collisions/landings resolve
+                           // smoothly and consistently every frame (no tunnelling or frame-rate
+                           // disparity in the tumble/pile)
   candyRFrac: 0.028,       // physics candy radius as a frac of the dispenser width
   _refW: 320,              // reference dispenser width the speeds above are tuned at
-  stuckMs: 2200,           // anti-stuck fallback: nudge a candy toward the chute after this
+  stuckMs: 1200,           // anti-stuck fallback: nudge a candy toward the chute after this (lowered
+                           // so a rare jam clears in ~1.2s instead of hanging ~2.2s)
   // SURFACE / WALL realism. The dispenser walls, slants + chute and the holding-tray basin are
   // RIGID, smooth surfaces: a wall doesn't absorb energy (the bounce uses the CANDY's own
   // restitution), but its smoothness scales how much tangential grip the candy gets. The global
   // `restitution`/`friction` above are now only the FALLBACK for a candy with no material profile —
   // each candy carries its own (COLORS[key].physics). Candy↔candy restitution combines as the
   // MINIMUM of the two (a hard candy landing on a soft pile barely bounces, like real life).
-  wallFrictionMul: 0.3,    // tangential grip on the SMOOTH moulded dispenser walls/slants/chute — low,
-                           // so even a tacky gummy slides down the chute (combined candy↔slick-plastic
-                           // friction is low); material grip differences show mainly in the tray pile
+  wallFrictionMul: 0.18,   // tangential grip on the SMOOTH moulded dispenser walls/slants/chute — kept
+                           // LOW (lowered from 0.3) so even a tacky gummy (red/green/pink) slides down
+                           // the slants + chute briskly instead of crawling — each chute-wall touch
+                           // does vy*=(1-friction*thisMul), so a high mul made the non-rolling gummies
+                           // bleed most of their fall speed. Material grip differences still show in
+                           // the tray pile (floorFrictionMul stays 1.0 → full friction on the floor)
   floorFrictionMul: 1.0,   // tangential grip on the holding-tray basin floor (full material friction)
   spinAirDamp: 0.6,        // angular velocity bled per SECOND while a candy is airborne
   rollGrip: 0.4,           // how strongly a rolling candy's spin couples to its surface speed/contact
   // SOFT-BODY (jiggle / squash) — a candy with `jiggle > 0` deforms on impact. impactVRef is the
   // reference impact speed (px/s at _refW) that maps to full `jiggle` deformation; wobbleMaxAmp caps
   // it. bumpKick scales the lateral/angular kick from an uneven surface (`bump`).
-  impactVRef: 520,         // impact speed → full jiggle (scaled by dispenser width)
-  wobbleMaxAmp: 0.42,      // hard cap on deformation amplitude (fraction of radius)
+  impactVRef: 340,         // impact speed → full jiggle (scaled by dispenser width). LOWER = a gentle
+                           // landing still visibly deforms a soft candy (the tray pile-up arrives slowly)
+  wobbleMaxAmp: 0.46,      // hard cap on deformation amplitude (fraction of radius)
   bumpKick: 0.22,          // fraction of impact speed redirected sideways by a bumpy surface
   // ---- ITEM 3: SHAPE-AWARE COLLISION + SETTLE ------------------------------------------------
   // Each candy collides as a coarse ELLIPSE (half-extents from its drawn silhouette, matched to the
@@ -573,8 +704,9 @@ export const DISPENSER = {
   // Deterministic per colour (shape is fixed → smoketest still reproduces); the only effect is HOW a
   // pile packs and rests, so piles never form the same way twice. Toggle `enabled`.
   shape: {
-    enabled: false,        // DORMANT — out of the requested scope (items 1+2). Deterministic, but
-                          // unverified here (sandbox down); enable + run smoketest before shipping.
+    enabled: true,         // ON — per-candy settle (snap/flat/wobble/roll) now comes from each
+                          // CANDY_PROFILES entry (.settle), so a cube snaps, a dome wobbles, a bean
+                          // rolls. Deterministic per colour → smoketest still reproduces.
     // half-extent multipliers (× collision radius) per silhouette + a SETTLE profile + rest `base`:
     //   roll = no preferred angle (keeps rolling)   flat = lies on its long axis (180°-symmetric)
     //   snap = snaps to nearest flat face (cube)     wobble = rocks on a point, then tips to an edge
@@ -587,8 +719,23 @@ export const DISPENSER = {
     },
     angStiffness: 26,      // angular restoring strength toward the rest orientation (per s)
     angDampFlat: 12,       // strong damping for flat/snap shapes → settle quickly + hold
-    angDampWobble: 2.4,    // light damping for a diamond → it ROCKS a few times on its point first
-    landKick: 3.5,         // angular kick (× normalized landing impact) a tippy shape gets on landing
+    angDampWobble: 5.0,    // medium damping for a wobble shape → it ROCKS a couple of times then settles
+    landKick: 5.0,         // angular ROCK kick (× normalized contact impact) a 'wobble' candy gets when
+                           // it lands on the floor OR strikes the pile — so it visibly rotates on impact
+    contactAngDamp: 9.0,   // a NON-rolling candy in contact (resting on the floor/pile) bleeds spin this
+                           // fast → its landing rock settles instead of spinning forever
+  },
+  // RIGHTING — eases every candy toward its canonical UPRIGHT orientation (its profile `restBase`:
+  // 0 for most candies, +90° for the lollipop) so it comes to REST exactly as drawn in the
+  // spritesheet. The strength ramps with how settled the candy is (none while it tumbles down fast,
+  // full as it slows to rest), rotating by the SHORTEST path, so the correction is spread across the
+  // slow part of the fall — the player never sees it snap. Tumble/roll/wobble still play on the way
+  // down; this only governs the final resting angle.
+  righting: {
+    enabled: true,
+    speedFrac: 0.7,    // righting is fully OFF above this fraction of the impact ref speed, fully ON at rest
+    rate: 6,           // how fast the angle eases toward upright (per second, scaled by settledness)
+    spinBleed: 8,      // how fast a settling candy's tumble/roll spin bleeds away so it doesn't fight righting
   },
   // ---- ITEM 1: SEEDED COSMETIC VARIETY -------------------------------------------------------
   // Deterministic per-candy jitter, seeded by a FIXED game seed XOR the candy id. Every dispensed
@@ -627,77 +774,79 @@ export const LEVELS = [
   {
     name: 'Warm Up',
     packetSlots: 6,
-    // 4 colors, 8 candies of each → 32 candies (the rack holds 33, so the queue empties and the
-    // front-first drain works cleanly). The 32 supply === the 8/8/8/8 the sixteen jars demand.
-    // (Supply is authored per-color; the rack flattens it into individual candies, interleaved.)
+    // PACKET TRAYS: 16 mono-colour trays of 3 candies each (4 trays per colour → 12 candies/colour,
+    // 48 total), authored round-robin so the 6 visible trays always show a mix. Tapping a tray
+    // BURSTS its 3 candies down the funnel into the holding tray. The 12-per-colour supply === the
+    // sixteen jars' demand (4 jars × cap 3). This level uses 4 of the 8 candy types; "Sweet Mix"
+    // exercises the other 4, so all eight candies are in play.
     packets: [
-      { id: 'p1', color: 'red',    shape: 'gummy', count: 8 },
-      { id: 'p2', color: 'yellow', shape: 'cube',  count: 8 },
-      { id: 'p3', color: 'blue',   shape: 'bean',  count: 8 },
-      { id: 'p4', color: 'green',  shape: 'jelly', count: 8 },
+      { color: 'red', count: 3 }, { color: 'blue', count: 3 }, { color: 'green', count: 3 }, { color: 'yellow', count: 3 },
+      { color: 'red', count: 3 }, { color: 'blue', count: 3 }, { color: 'green', count: 3 }, { color: 'yellow', count: 3 },
+      { color: 'red', count: 3 }, { color: 'blue', count: 3 }, { color: 'green', count: 3 }, { color: 'yellow', count: 3 },
+      { color: 'red', count: 3 }, { color: 'blue', count: 3 }, { color: 'green', count: 3 }, { color: 'yellow', count: 3 },
     ],
-    // 16 jars (cap 2) → distributed round-robin into the 4 queue lanes (lane = index % 4), so each
-    // lane is a 4-deep queue (3 shown + 1 hidden behind). Still balanced (4 jars × cap 2 = 8 per
-    // color === the per-color supply) and the lanes still read as MIXED queues, but this is NOT a
-    // Latin square — it is CLUSTERED + STAGGERED so the player must BUFFER and sequence:
-    //   • The four lane FRONTS start as red / red / red / blue — only TWO colors are collectable, so
-    //     GREEN and YELLOW have NO active jar at the start and must WAIT in the center (cap 6) until a
-    //     lane advances. The rack interleaves all four colors and the front-first rule means a green
-    //     or yellow often blocks the candy you want, forcing you to drop it into the center buffer.
-    //   • Because three lanes share red up front, those three lanes advance together and the active
-    //     colors shift in waves — so the unavailable colors rotate and the buffer must be drained at
-    //     the right moment. Careless "tap everything" play fills the center with colors no jar takes
-    //     and gets STUCK (a real loss); sensible greedy + buffering wins (peaks at ~3/6 in the center).
-    // Lanes front→back:
+    // 16 jars (cap 3) → round-robin into the 4 queue lanes (lane = index % 4), each a 4-deep queue
+    // (3 shown + 1 hidden). Balanced (4 jars × cap 3 = 12 per colour === supply). CLUSTERED + STAGGERED
+    // so the player must BUFFER + sequence: the four lane FRONTS start red / red / red / blue, so GREEN
+    // and YELLOW have no active jar and a burst of them must WAIT in the center (cap 6, ~two packets).
+    // Careless "tap everything" floods the center with colours no jar takes and gets STUCK; greedy +
+    // buffering wins. Lanes front→back:
     //   L0 red → blue → green → yellow      L1 red → blue → yellow → green
     //   L2 red → yellow → green → blue      L3 blue → red → green → yellow
     jars: [
-      { id: 'j1',  color: 'red',    shape: 'gummy', capacity: 2 }, // L0 front
-      { id: 'j2',  color: 'red',    shape: 'gummy', capacity: 2 }, // L1 front
-      { id: 'j3',  color: 'red',    shape: 'gummy', capacity: 2 }, // L2 front
-      { id: 'j4',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L3 front
-      { id: 'j5',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L0 #2
-      { id: 'j6',  color: 'blue',   shape: 'bean',  capacity: 2 }, // L1 #2
-      { id: 'j7',  color: 'yellow', shape: 'cube',  capacity: 2 }, // L2 #2
-      { id: 'j8',  color: 'red',    shape: 'gummy', capacity: 2 }, // L3 #2
-      { id: 'j9',  color: 'green',  shape: 'jelly', capacity: 2 }, // L0 #3
-      { id: 'j10', color: 'yellow', shape: 'cube',  capacity: 2 }, // L1 #3
-      { id: 'j11', color: 'green',  shape: 'jelly', capacity: 2 }, // L2 #3
-      { id: 'j12', color: 'green',  shape: 'jelly', capacity: 2 }, // L3 #3
-      { id: 'j13', color: 'yellow', shape: 'cube',  capacity: 2 }, // L0 back (hidden)
-      { id: 'j14', color: 'green',  shape: 'jelly', capacity: 2 }, // L1 back (hidden)
-      { id: 'j15', color: 'blue',   shape: 'bean',  capacity: 2 }, // L2 back (hidden)
-      { id: 'j16', color: 'yellow', shape: 'cube',  capacity: 2 }, // L3 back (hidden)
+      { id: 'j1',  color: 'red',    capacity: 3 }, // L0 front
+      { id: 'j2',  color: 'red',    capacity: 3 }, // L1 front
+      { id: 'j3',  color: 'red',    capacity: 3 }, // L2 front
+      { id: 'j4',  color: 'blue',   capacity: 3 }, // L3 front
+      { id: 'j5',  color: 'blue',   capacity: 3 }, // L0 #2
+      { id: 'j6',  color: 'blue',   capacity: 3 }, // L1 #2
+      { id: 'j7',  color: 'yellow', capacity: 3 }, // L2 #2
+      { id: 'j8',  color: 'red',    capacity: 3 }, // L3 #2
+      { id: 'j9',  color: 'green',  capacity: 3 }, // L0 #3
+      { id: 'j10', color: 'yellow', capacity: 3 }, // L1 #3
+      { id: 'j11', color: 'green',  capacity: 3 }, // L2 #3
+      { id: 'j12', color: 'green',  capacity: 3 }, // L3 #3
+      { id: 'j13', color: 'yellow', capacity: 3 }, // L0 back (hidden)
+      { id: 'j14', color: 'green',  capacity: 3 }, // L1 back (hidden)
+      { id: 'j15', color: 'blue',   capacity: 3 }, // L2 back (hidden)
+      { id: 'j16', color: 'yellow', capacity: 3 }, // L3 back (hidden)
     ],
     centerContainer: { capacity: 6 },
   },
   {
-    name: 'Buffer Up',
+    name: 'Sweet Mix',
     packetSlots: 6,
-    // 9 packets across 3 colors (3 packets = 18 each). Each color is collected by THREE
-    // jars of 6 (so supply 18 === jar capacity 18 per color). The center's 6-candy cap and
-    // the tray's 18-candy buffer drive the sequencing.
+    // The OTHER 4 candy types (pink marshmallow, orange caramel, purple wrapped, cyan lollipop) so
+    // every candy is playable. STRUCTURALLY IDENTICAL to "Warm Up" (a colour-relabelled copy of the
+    // proven clustered+staggered 16-jar / 4-lane layout), winnable by the same greedy+buffer play:
+    // 16 trays of 3 (4 per colour → 12 each, 48 total); 16 jars cap 3 (4 jars × cap 3 = 12 === supply).
+    // Fronts start pink / pink / pink / orange, so purple + cyan must WAIT in the center buffer.
+    // Lanes front→back:
+    //   L0 pink → orange → purple → cyan      L1 pink → orange → cyan → purple
+    //   L2 pink → cyan → purple → orange       L3 orange → pink → purple → cyan
     packets: [
-      { id: 'p1', color: 'red',    shape: 'gummy', count: 6 },
-      { id: 'p2', color: 'blue',   shape: 'bean',  count: 6 },
-      { id: 'p3', color: 'green',  shape: 'jelly', count: 6 },
-      { id: 'p4', color: 'red',    shape: 'gummy', count: 6 },
-      { id: 'p5', color: 'blue',   shape: 'bean',  count: 6 },
-      { id: 'p6', color: 'green',  shape: 'jelly', count: 6 },
-      { id: 'p7', color: 'red',    shape: 'gummy', count: 6 },
-      { id: 'p8', color: 'blue',   shape: 'bean',  count: 6 },
-      { id: 'p9', color: 'green',  shape: 'jelly', count: 6 },
+      { color: 'pink', count: 3 }, { color: 'orange', count: 3 }, { color: 'purple', count: 3 }, { color: 'cyan', count: 3 },
+      { color: 'pink', count: 3 }, { color: 'orange', count: 3 }, { color: 'purple', count: 3 }, { color: 'cyan', count: 3 },
+      { color: 'pink', count: 3 }, { color: 'orange', count: 3 }, { color: 'purple', count: 3 }, { color: 'cyan', count: 3 },
+      { color: 'pink', count: 3 }, { color: 'orange', count: 3 }, { color: 'purple', count: 3 }, { color: 'cyan', count: 3 },
     ],
     jars: [
-      { id: 'j1', color: 'red',   shape: 'gummy', capacity: 6 },
-      { id: 'j2', color: 'blue',  shape: 'bean',  capacity: 6 },
-      { id: 'j3', color: 'green', shape: 'jelly', capacity: 6 },
-      { id: 'j4', color: 'red',   shape: 'gummy', capacity: 6 },
-      { id: 'j5', color: 'blue',  shape: 'bean',  capacity: 6 },
-      { id: 'j6', color: 'green', shape: 'jelly', capacity: 6 },
-      { id: 'j7', color: 'red',   shape: 'gummy', capacity: 6 },
-      { id: 'j8', color: 'blue',  shape: 'bean',  capacity: 6 },
-      { id: 'j9', color: 'green', shape: 'jelly', capacity: 6 },
+      { id: 'j1',  color: 'pink',   capacity: 3 }, // L0 front
+      { id: 'j2',  color: 'pink',   capacity: 3 }, // L1 front
+      { id: 'j3',  color: 'pink',   capacity: 3 }, // L2 front
+      { id: 'j4',  color: 'orange', capacity: 3 }, // L3 front
+      { id: 'j5',  color: 'orange', capacity: 3 }, // L0 #2
+      { id: 'j6',  color: 'orange', capacity: 3 }, // L1 #2
+      { id: 'j7',  color: 'cyan',   capacity: 3 }, // L2 #2
+      { id: 'j8',  color: 'pink',   capacity: 3 }, // L3 #2
+      { id: 'j9',  color: 'purple', capacity: 3 }, // L0 #3
+      { id: 'j10', color: 'cyan',   capacity: 3 }, // L1 #3
+      { id: 'j11', color: 'purple', capacity: 3 }, // L2 #3
+      { id: 'j12', color: 'purple', capacity: 3 }, // L3 #3
+      { id: 'j13', color: 'cyan',   capacity: 3 }, // L0 back (hidden)
+      { id: 'j14', color: 'purple', capacity: 3 }, // L1 back (hidden)
+      { id: 'j15', color: 'orange', capacity: 3 }, // L2 back (hidden)
+      { id: 'j16', color: 'cyan',   capacity: 3 }, // L3 back (hidden)
     ],
     centerContainer: { capacity: 6 },
   },

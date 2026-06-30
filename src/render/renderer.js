@@ -8,10 +8,11 @@
 
 import { bus, EV } from '../core/events.js';
 import { COLORS, THEME, RENDER, RULES, BIN, DIAL, ART, PACKET, CENTER, JAR, SCORING } from '../config.js';
-import candyUrl from '../../newcandy/newcandies.png';
-import dispenserUrl from '../../candyDispenser/candy_dispenser.png';
+import candyUrl from '../../candy_spritesheet_final_1.png';
+import dispenserUrl from '../../candyDispenser/widecontainer.png';
 import jarUrl from '../../Jar/jars.png';
 import bgUrl from '../../background/background.png';
+import bgVideoUrl from '../../background/DynamicBG.mp4';
 import holdingTrayUrl from '../../containers/newholdingtray.png';
 
 const SPRITE_COLS = 4, SPRITE_ROWS = 2;
@@ -72,9 +73,13 @@ export class Renderer {
     this.cellW = 0; this.cellH = 0;
     this.candyContent = {}; // 'col,row' -> tight alpha bbox of that candy within the sheet
     const onSheet = () => {
+      // The candy sheet (candy_spritesheet_final_1.png) is a clean 4×2 grid, but each cell sits on a
+      // solid GREEN or BLACK studio background. Chroma-key those out to transparent (per cell, sampled
+      // from its corners) so candies blit cleanly; then measure each candy's tight content box.
+      this.sprites = this._buildSpriteCanvas(this.sprites);
       this.spritesReady = true;
-      this.cellW = this.sprites.naturalWidth / SPRITE_COLS;
-      this.cellH = this.sprites.naturalHeight / SPRITE_ROWS;
+      this.cellW = (this.sprites.naturalWidth || this.sprites.width) / SPRITE_COLS;
+      this.cellH = (this.sprites.naturalHeight || this.sprites.height) / SPRITE_ROWS;
       this._measureCandyCells();
     };
     this.sprites.onload = onSheet;
@@ -100,12 +105,48 @@ export class Renderer {
     this.jarImg.onload = () => { this.jarReady = true; };
     this.jarImg.src = jarUrl;
     if (this.jarImg.complete && this.jarImg.naturalWidth) this.jarReady = true;
-    // full-screen candy background (drawn cover-fit behind everything)
+    // full-screen candy background (drawn cover-fit behind everything). The PNG is the instant
+    // POSTER/fallback; once the looping DynamicBG.mp4 has decoded a frame it's drawn instead.
     this.bgImg = new Image();
     this.bgReady = false;
     this.bgImg.onload = () => { this.bgReady = true; };
     this.bgImg.src = bgUrl;
     if (this.bgImg.complete && this.bgImg.naturalWidth) this.bgReady = true;
+    // animated background video — SEAMLESS LOOP via TWO videos + a short CROSSFADE at the seam. A
+    // single <video loop> visibly stalls at the loop point (the decoder seeks back to 0, freezing the
+    // drawn frame, and its readyState dips — which would also flash the PNG). Instead we keep a second
+    // copy and, ~_bgXfade seconds before the active one ends, START the other from frame 0 and DISSOLVE
+    // into it (render() draws the incoming over the outgoing with a rising alpha). At the seam we just
+    // promote the incoming + rewind the finished copy in the background — so the rewind is hidden AND
+    // any first-frame/last-frame content mismatch is smoothed by the dissolve. Both muted + inline so
+    // they autoplay; a pointer gesture + visibility resume cover stricter autoplay policies. The PNG is
+    // only the pre-first-frame poster — once a video frame exists we draw video and never fall back.
+    this.bgVideoReady = false;
+    this.bgVideoStarted = false;
+    this._bgVideos = [];
+    this._bgActive = 0;
+    this._bgXfade = 0.6;   // crossfade length (seconds) at the loop seam
+    try {
+      const make = () => {
+        const v = document.createElement('video');
+        v.src = bgVideoUrl;
+        v.muted = true; v.defaultMuted = true; v.playsInline = true; v.preload = 'auto';
+        v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
+        return v;
+      };
+      const a = make(), b = make();
+      this._bgVideos = [a, b];
+      const onData = () => { this.bgVideoReady = true; this.bgVideoStarted = true; };
+      a.addEventListener('loadeddata', onData);
+      b.addEventListener('loadeddata', onData);
+      this._bgPlay = (v) => { if (!v) return; const p = v.play(); if (p && p.catch) p.catch(() => {}); };
+      const start = () => { this._bgPlay(this._bgVideos[this._bgActive]); try { const o = this._bgVideos[1 - this._bgActive]; o.pause(); o.currentTime = 0; } catch (e) {} };
+      a.addEventListener('canplay', start);
+      start();
+      const kick = () => { this._bgPlay(this._bgVideos[this._bgActive]); window.removeEventListener('pointerdown', kick); };
+      window.addEventListener('pointerdown', kick, { once: true });
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) this._bgPlay(this._bgVideos[this._bgActive]); });
+    } catch (e) { this._bgVideos = []; }
     // the center "holding" tray (wide). Drawn to fill its layout box; CENTER aspect matches the art
     // so it isn't distorted. A procedural glass box stands in until the PNG loads.
     this.holdingTrayImg = new Image();
@@ -267,6 +308,50 @@ export class Renderer {
     ctx.restore();
   }
 
+  // Chroma-key the candy sheet's per-cell studio backgrounds (saturated GREEN or BLACK) to
+  // transparent, returning a CANVAS used in place of the raw Image. Each cell's background colour is
+  // sampled from its four corners; pixels within `T` of it go transparent, with a small feather band
+  // (T..T2) so anti-aliased rims don't leave a coloured halo. Dark (black) backgrounds use a tighter
+  // threshold so a candy's own dark outline isn't eaten. Falls back to the raw image if the canvas is
+  // unreadable (e.g. a tainted/cross-origin source — not the case for a bundled local asset).
+  _buildSpriteCanvas(img) {
+    const W = img.naturalWidth, H = img.naturalHeight;
+    if (!W || !H) return img;
+    const cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const c = cv.getContext('2d', { willReadFrequently: true });
+    c.drawImage(img, 0, 0);
+    let id;
+    try { id = c.getImageData(0, 0, W, H); } catch { return img; }
+    const d = id.data;
+    const cw = W / SPRITE_COLS, ch = H / SPRITE_ROWS;
+    for (let row = 0; row < SPRITE_ROWS; row++) {
+      for (let col = 0; col < SPRITE_COLS; col++) {
+        const ox = Math.floor(col * cw), oy = Math.floor(row * ch);
+        const cwI = Math.floor(cw), chI = Math.floor(ch);
+        // background colour = mean of the four corner samples (inset a few px off the very edge)
+        const corners = [[3, 3], [cwI - 4, 3], [3, chI - 4], [cwI - 4, chI - 4]];
+        let br = 0, bg = 0, bb = 0;
+        for (const [sx, sy] of corners) { const i = ((oy + sy) * W + (ox + sx)) * 4; br += d[i]; bg += d[i + 1]; bb += d[i + 2]; }
+        br /= 4; bg /= 4; bb /= 4;
+        const dark = (br + bg + bb) / 3 < 45;
+        const T = dark ? 62 : 104, T2 = T * 1.5;
+        for (let y = 0; y < chI; y++) {
+          for (let x = 0; x < cwI; x++) {
+            const i = ((oy + y) * W + (ox + x)) * 4;
+            const dr = d[i] - br, dg = d[i + 1] - bg, db = d[i + 2] - bb;
+            const dist = Math.sqrt(dr * dr + dg * dg + db * db);
+            if (dist < T) d[i + 3] = 0;
+            else if (dist < T2) d[i + 3] = Math.min(d[i + 3], Math.round(((dist - T) / (T2 - T)) * 255));
+          }
+        }
+      }
+    }
+    c.putImageData(id, 0, 0);
+    cv.naturalWidth = W; cv.naturalHeight = H;  // expandos so callers reading naturalWidth still work
+    return cv;
+  }
+
   // Measure each candy cell's tight alpha bounding box within the spritesheet, so a
   // seated candy can be cropped to its content (no per-sprite padding) and centered.
   _measureCandyCells() {
@@ -419,8 +504,15 @@ export class Renderer {
   // preserved into a `box`-sized square centered at (cx, cy). Returns false (so callers can fall
   // back to a procedural draw) if the sheet isn't ready or the color has no rect.
   _blitCandySprite(ctx, col, cx, cy, box) {
-    if (!this.spritesReady || !col || !col.spriteRect) return false;
-    const [sx, sy, sw, sh] = col.spriteRect;
+    if (!this.spritesReady || !col) return false;
+    // Prefer the candy's TIGHT measured content box (set after chroma-keying); fall back to the
+    // static full-cell spriteRect before the measure pass has run / if the color has no cell.
+    let sx, sy, sw, sh;
+    const key = col.sprite && `${col.sprite[0]},${col.sprite[1]}`;
+    const cc = key && this.candyContent[key];
+    if (cc) { sx = cc.sx; sy = cc.sy; sw = cc.sw; sh = cc.sh; }
+    else if (col.spriteRect) { [sx, sy, sw, sh] = col.spriteRect; }
+    else return false;
     const s = box / Math.max(sw, sh);     // fit the longer side; candies are ~square so this reads centered
     const dw = sw * s, dh = sh * s;
     ctx.drawImage(this.sprites, sx, sy, sw, sh, cx - dw / 2, cy - dh / 2, dw, dh);
@@ -549,12 +641,45 @@ export class Renderer {
     this.fps += ((1 / Math.max(dt, 1e-4)) - this.fps) * 0.1;
     this._t = (this._t || 0) + dt;   // renderer clock (s) for the special-candy glint pulse
 
-    if (this.bgReady) {
-      // cover-fit the candy background (fill the viewport, preserve aspect, crop overflow)
-      const iw = this.bgImg.naturalWidth, ih = this.bgImg.naturalHeight;
+    // BACKGROUND: the two-video seamless loop (see constructor). Draw the ACTIVE video, and near the
+    // seam DISSOLVE the incoming copy over it; at the seam promote the incoming + rewind the finished
+    // one (its rewind is hidden behind the now-full-alpha incoming). drawImage holds a video's last
+    // frame during a rewind, so there's never a stall or a PNG flash mid-loop. All cover-fit.
+    const vids = this._bgVideos;
+    const coverFit = (img, iw, ih) => {
+      if (!iw || !ih) return;
       const scale = Math.max(this.w / iw, this.h / ih);
       const dw = iw * scale, dh = ih * scale;
-      ctx.drawImage(this.bgImg, (this.w - dw) / 2, (this.h - dh) / 2, dw, dh);
+      ctx.drawImage(img, (this.w - dw) / 2, (this.h - dh) / 2, dw, dh);
+    };
+    if (this.bgVideoStarted && vids && vids.length === 2 && vids[this._bgActive].videoWidth > 0) {
+      let A = vids[this._bgActive];
+      const dur = A.duration;
+      // SEAM: the active reached its end — promote the (already crossfading) incoming, rewind the old.
+      if (A.ended || (dur && isFinite(dur) && A.currentTime >= dur - 0.03)) {
+        try { A.pause(); A.currentTime = 0; } catch (e) {}
+        this._bgActive = 1 - this._bgActive;
+        A = vids[this._bgActive];
+      }
+      const B = vids[1 - this._bgActive];
+      let fade = 0;
+      const d = A.duration;
+      if (d && isFinite(d)) {
+        const xf = Math.min(this._bgXfade, d * 0.3);
+        const rem = d - A.currentTime;
+        if (rem <= xf) {
+          if (B.paused) { try { B.currentTime = 0; } catch (e) {} this._bgPlay(B); }  // start the incoming
+          fade = Math.max(0, Math.min(1, (xf - rem) / xf));
+        }
+      }
+      coverFit(A, A.videoWidth, A.videoHeight);
+      if (fade > 0 && B.videoWidth > 0) {
+        ctx.save(); ctx.globalAlpha = fade;
+        coverFit(B, B.videoWidth, B.videoHeight);
+        ctx.restore();
+      }
+    } else if (this.bgReady) {
+      coverFit(this.bgImg, this.bgImg.naturalWidth, this.bgImg.naturalHeight);
     } else {
       ctx.fillStyle = THEME.bg;
       ctx.fillRect(0, 0, this.w, this.h);
@@ -1068,7 +1193,7 @@ export class Renderer {
       this.w / 2, this.h / 2, Math.max(this.w, this.h) * 0.75);
     g.addColorStop(0, 'rgba(0,0,0,0)');
     // a heavy dark vignette would muddy the bright candy background — keep it gentle there
-    g.addColorStop(1, this.bgReady ? 'rgba(0,0,0,0.16)' : THEME.bgVignette);
+    g.addColorStop(1, (this.bgReady || this.bgVideoReady) ? 'rgba(0,0,0,0.16)' : THEME.bgVignette);
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, this.w, this.h);
   }
@@ -1133,27 +1258,35 @@ export class Renderer {
     }
   }
 
-  // ---- candy rack inside the dispenser's inner rectangle (one candy per cell) ----
+  // ---- top PACKET TRAYS inside the dispenser cavity (one mono-color tray per slot) ----
+  // Each tray draws its color's CandyTrayPackets art (a tray full of that one candy) + a small
+  // badge showing how many candies will BURST out. Tapping a tray spills its whole batch.
   _drawPacketsPuzzle(ctx, state) {
     const L = state.layout;
     const slots = state.packets.slots;
     for (let i = 0; i < slots.length; i++) {
       const tl = L.packets[i];
       if (!tl) continue;
-      const color = slots[i].color;
-      if (!color) continue; // empty cell — nothing drawn (the rack thins out as candies fall)
-      const col = COLORS[color];
+      const packet = slots[i].packet;
+      if (!packet) continue;            // empty tray — nothing drawn (the queue has drained here)
+      const col = COLORS[packet.color];
       const box = tl.r * 2;
-      // a candy still BEHIND another (blocked by the dispenser-stack rule) is dimmed, so the
-      // tappable front-row candies read as the live ones.
-      const dim = state._dispenseBlocked(i) ? 0.42 : 1;
-      ctx.globalAlpha = dim;
-      // each cell IS a candy: blit its art (procedural candy stands in until the sheet loads)
-      if (!this._blitCandySprite(ctx, col, tl.x, tl.y, box * 0.98)) {
-        this._candy(ctx, tl.x, tl.y, tl.r * 0.82, col, { shape: col && col.shape });
+      const art = this.packetImgs[col && col.art];
+      if (imgReady(art)) {
+        this._drawFitContain(ctx, art, tl.x, tl.y, box * 0.98, 1);    // the tray-of-candies art
+      } else if (!this._blitCandySprite(ctx, col, tl.x, tl.y, box * 0.9)) {
+        this._packetTileFallback(ctx, tl, col, packet.count);         // procedural until art loads
       }
-      ctx.globalAlpha = 1;
-      if (slots[i].special) this._specialGlint(ctx, tl.x, tl.y, tl.r, dim);
+      // batch-size badge (top-right of the tray)
+      const br = Math.max(8, tl.r * 0.30);
+      const bx = tl.x + tl.r - br * 0.7, by = tl.y - tl.r + br * 0.7;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = THEME.text;
+      ctx.font = `600 ${Math.round(br * 1.15)}px -apple-system, system-ui, sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(packet.count), bx, by + 1);
+      // (the ×N multiplier is now a JAR property — drawn on the jar, not the tray; see _drawOneJar)
     }
   }
 
@@ -1258,6 +1391,11 @@ export class Renderer {
     if (ctx.globalAlpha > 0.02) this._candy(ctx, gl.cx, gl.cy, indR, col, { shape: col.shape });
     ctx.globalAlpha = 1;
 
+    // MULTIPLIER JAR: the same gold shimmer + ×N badge the multiplier candy used, now worn by the jar
+    // itself (over its glass bowl). Shown on previews too — faded by baseA — so the upcoming ×N jar
+    // reads in the queue. Completing it pays the multiplier (puzzle.js BOX_CLEAR).
+    if (jar.multiplier) this._specialGlint(ctx, gl.cx, gl.cy, Math.min(gl.gw, gl.gh) * 0.52, baseA);
+
     // active jar: just the body + fading color indicator; candies fall in and rest at the bottom
     // (no capacity wells, no fill count).
   }
@@ -1352,18 +1490,22 @@ export class Renderer {
   }
 
   // ---- candies spilling through the dispenser (physics transit objects) ----
+  // Draws both the ADMITTED candies falling into the tray (state.transit) and the OVERFLOW candies
+  // piled at the chute gate waiting to be let in (state.waiting) — same physics-object draw path.
   _drawTransit(ctx, state) {
-    for (const c of state.transit) {
+    const draw = (c) => {
       const col = COLORS[c.colorKey];
-      if (!col) continue;
+      if (!col) return;
       this._candy(ctx, c.x, c.y, c.r, col, { shape: col.shape, angle: c.angle || 0, squash: this._squashOf(c) });
       if (c.special) this._specialGlint(ctx, c.x, c.y, c.r);
-    }
+    };
+    for (const c of state.transit) draw(c);
+    if (state.waiting) for (const c of state.waiting) draw(c);
   }
 
-  // Marks a "special" MULTIPLIER candy so a first-timer reads "bonus" in a second: a warm gold
-  // shimmer (halo + twinkling stars) that says "treasure", PLUS an explicit "×N" badge that names
-  // the multiplier. Drawn OVER the candy sprite. `alpha` fades it with a closing jar.
+  // Marks a MULTIPLIER target (now the JAR — formerly a candy) so a first-timer reads "bonus" in a
+  // second: a warm gold shimmer (halo + twinkling stars) that says "treasure", PLUS an explicit "×N"
+  // badge that names the multiplier. Drawn centred at (x,y) with reach r; `alpha` fades it (previews).
   _specialGlint(ctx, x, y, r, alpha = 1) {
     const t = this._t || 0;
     const pulse = 0.5 + 0.5 * Math.sin(t * 4.5);

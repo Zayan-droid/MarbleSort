@@ -33,13 +33,18 @@ There is **NO storage tray** — the CENTER holding tray (capacity 6) is the onl
 candy that tumbles into the holding tray and PILES. A candy can only be dispensed once the candy
 directly IN FRONT of it — the next one toward the chute, i.e. one row DOWN in its column — has been
 removed, so each column empties bottom-up (blocked candies are dimmed; `tappableSlots()` lists the
-live ones). The player may rain several down at once, but only while the tray pipeline (candies
-falling + already in the tray) stays within the center's capacity, so the tray never overflows. Once the pile SETTLES the game AUTO-ROUTES it: matching candies flow into
+live ones). The player may rain several down at once. **OVERFLOW GATE:** taps past the tray's
+capacity are allowed — the surplus candies PILE UP at the chute entrance (the gate line, `DISPENSER.gate`)
+and are held there (they never pass into the tray) until a slot frees, at which point the candy
+NEAREST the entrance is admitted and tumbles in (`PuzzleGame._manageGate` + `this.waiting`; the funnel
+holds up to `gate.queueMax` before a further tap is refused). So the tray itself never exceeds
+capacity — the funnel is the overflow buffer. Once the pile SETTLES the game AUTO-ROUTES it: matching candies flow into
 any accepting ACTIVE jar (greedily, across same-color front jars); a color whose jar isn't currently
 active simply WAITS in the center until a lane advances and opens it. Win by filling every jar; LOSE
-only when the center holds candies no active jar will take and there's no way to make progress (no
-candies left to drop, or the center is full so none can be dropped to complete a jar and advance a
-lane). (The manual `onJarTapped` intent still exists and works — auto-routing just fires it for you
+only when the holding tray is FULL (no room to drop another candy) AND no candy in the tray fits any
+active jar — a dead board with nowhere to go. The lose screen is held back `ANIM.loseRevealMs` (~6.5s)
+after the board first goes dead so the player sees + accepts the defeat (a softlock guard also trips
+when no supply remains to ever fill the tray). (The manual `onJarTapped` intent still exists and works — auto-routing just fires it for you
 the instant the tray settles — so a tap on a jar remains a harmless, optional override.)
 The priority after correct gameplay is *sensory feel*: synchronized audio, visual, and haptic
 feedback. Vanilla JS + HTML5 Canvas, Vite, fully synthesized Web Audio (no audio files). Candies
@@ -77,8 +82,9 @@ There is no test framework, linter, or typechecker configured. `smoketest.mjs` i
 check: it drives the real `PuzzleGame` (no browser APIs needed) and asserts the full loop — tap a
 rack candy → ONE candy tumbles + piles in the tray → auto-routes to its active jar → all jars
 complete → WIN (the shipped 16-jar / 4-lane level, played with no storage buffer) — plus the
-tray-pipeline cap (a drop beyond the center capacity is rejected), the center-buffer wait/route
-(an unroutable color waits in the center, then routes when its lane advances), stuck detection,
+overflow gate (a burst past the tray capacity PILES at the chute gate, candies conserved + the tray
+never exceeds capacity, then each waiting candy is admitted as the tray frees → WIN), the
+center-buffer wait/route (an unroutable color waits in the center, then routes when its lane advances), stuck detection,
 `validateLevel`, jar-queue structure, and responsive layout across a size matrix. Run it after
 changing anything in `src/game/` or `src/config.js`.
 
@@ -112,11 +118,14 @@ transit, dt, now)` runs sub-stepped gravity + candy/candy circle collisions + sl
 the chute exit the SAME sim keeps going against the **tray basin** (`this.physics.basin`: the holding
 tray's inner walls + floor, set each `resize()` from `CENTER.basin` fractions of the center box) so
 the candies TUMBLE IN AND PILE — there are no grooves. `PuzzleGame` owns `this.transit` (the
-spilling candies, plain `{x,y,vx,vy,r,...}` physics objects) and `this._releasing` (the input lock).
-`onPacketTapped` spawns ONE candy at the tapped rack cell with a gentle deterministic nudge toward
-the chute (no `Math.random`, so the funnel reliably delivers and the smoketest is reproducible); it
-is gated so `transit + center.count() < center.capacity` (the player may tap several but never
-overflows the tray). Candies are NOT
+ADMITTED spilling candies, plain `{x,y,vx,vy,r,...}` physics objects), `this.waiting` (the OVERFLOW
+candies piled at the chute gate, same object shape but flagged `admitted:false` so `dispenser.js`
+holds them above `DISPENSER.gate.yFrac` — see the gate floor in `_constrain`), and `this._releasing`
+(the input lock). `onPacketTapped` bursts a packet tray: each candy is ADMITTED into `transit` while
+the tray has a free slot (`capacity − center.count() − transit.length`), else pushed to `waiting`;
+`_manageGate()` later moves the lowest waiting candies into `transit` as the tray frees. A tap is only
+refused once the whole pipeline (`transit + waiting + center`) hits `capacity + gate.queueMax`.
+Candies are NOT
 removed at the chute — `update()` watches the pile via `_traySettled()` (all candies in the basin and
 moving below `CENTER.settle.speedFracH` of box height for `holdMs`; `maxMs` is a hang-guard) and then
 `_depositTray()` hands the whole batch to the center container, each frozen at its physics resting
@@ -156,10 +165,11 @@ Jar completion + `BOX_CLEAR` fire once a jar is full AND its candies have settle
 `jar.complete` and starts the closing animation; once it finishes (`JAR.close` ms later)
 `_resolveJarCompletions` sets `jar.removed` (the renderer then stops drawing the jar + its candies).
 A completed/removed jar still counts as complete for the win check. **Win** =
-packets empty + center empty + all jars complete. **Lose (stuck)** = center non-empty, no ACTIVE jar
-accepts any center color, AND no way to progress (no packets left to drop, or the center is full so
-none can be dropped to complete a jar and advance a lane). Both are checked only when everything has
-settled (`_allSettled`).
+packets empty + center empty + waiting (gate) empty + all jars complete. **Lose (stuck)** = center
+non-empty, no ACTIVE jar accepts any center color, no lane-advance pending, AND the tray is FULL (or
+no supply remains to ever fill it). Both are checked only on a settled flow (`_flowSettled`). The lose
+is DELAYED `ANIM.loseRevealMs` (~6.5s) after the board first goes dead (`_stuckSince`); the timer
+cancels the instant the stuck state clears, so only a stable dead board ends the game.
 
 **Event bus is the spine of "feel."** `src/core/events.js` exposes a singleton `bus` + `EV`
 constants. `puzzle.js` only *emits*; `main.js` wires each event to audio + haptics; `renderer.js`

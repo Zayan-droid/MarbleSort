@@ -105,13 +105,14 @@
   </head>
   <body>
     <canvas id="game"></canvas>
-    <div id="hint">tap a packet → fills the center · tap a matching jar · tap the tray to stash / retrieve · D for debug</div>
+    <div id="hint">tap a packet → bursts its candies into the holding tray · matching candies auto-fill the active jars · M mute · H haptics · R restart · D debug</div>
     <div id="overlay">
       <h1>CANDY SORT</h1>
       <p>
-        Tap a packet to tip its candies into the center container. Tap a matching jar to fill it,
-        or park the group in the storage tray on the right when no jar fits — then bring it back
-        later. The center holds one packet; the tray holds three. Fill every jar to win.
+        Tap a candy packet to BURST its batch down the funnel into the holding tray. Matching candies
+        flow into the active jars below; a colour with no open jar waits in the tray (it holds 6) until
+        a jar opens. Pick your packets wisely — don't flood the tray with colours no jar will take.
+        Fill every jar to win.
       </p>
       <p class="status" id="status"></p>
       <button class="start" id="startBtn">Tap to Play</button>

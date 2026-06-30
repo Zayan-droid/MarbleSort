@@ -1,121 +1,80 @@
-// packetQueue.js — PacketQueueManager: the dispenser's CANDY RACK.
+// packetQueue.js — PacketQueueManager: the TOP CANDY PACKET TRAYS.
 //
-// The dispenser is FILLED with individual candies (a grid of `slots`, each holding ONE candy
-// color or null). ONE TAP drops ONE candy: `consume(slotIndex)` hands over that single candy's
-// color and refills the slot from the queue. The level still AUTHORS its supply as mono packets
-// (`packets:[{color,count}]`); this manager flattens them into a flat queue of individual candies,
-// INTERLEAVED round-robin across the colors so the rack shows an assorted mix rather than colour
-// blocks. Order is deterministic (no Math.random) so the headless smoketest is reproducible.
+// The top of the dispenser shows a row of MONO-COLOR packet trays (CandyTrayPackets art). Each
+// packet holds a small BATCH of candies of ONE colour. ONE TAP BURSTS the whole packet: `consume(
+// slotIndex)` hands over the batch (an array of {color, special}) and the emptied tray refills from
+// the queue. The level AUTHORS its supply as `packets:[{color, count}]` — each entry is ONE packet
+// tray of `count` candies (default PACKET.packetSize). The queue keeps the packets in authored order
+// (mono-color, NOT interleaved — a tray is a single colour). Order is deterministic (no Math.random)
+// so the headless smoketest reproduces.
 
 import { resolveColor } from './traySlots.js';
-import { CENTER, DISPENSER, SCORING } from '../config.js';
+import { PACKET } from '../config.js';
 
 export class PacketQueueManager {
-  constructor(levelData, rackCapacity) {
+  constructor(levelData) {
     const defs = (levelData && levelData.packets) || [];
-    // per-color supply (preserving first-appearance order), then round-robin into a flat queue
-    const groups = defs.map((d) => ({
-      color: resolveColor(d.color),
-      n: d.count != null ? d.count : CENTER.capacity,
-    }));
-    const counts = groups.map((g) => g.n);
-    let left = counts.reduce((a, b) => a + b, 0);
-    // each queue entry is { color, special }. `special` (the multiplier candy) is flagged below.
-    this.queue = [];
-    while (left > 0) {
-      for (let i = 0; i < groups.length; i++) {
-        if (counts[i] > 0) { this.queue.push({ color: groups[i].color, special: false }); counts[i]--; left--; }
-      }
-    }
-    // MULTIPLIER CANDY: deterministically flag every Nth candy in the flattened, interleaved queue
-    // (no Math.random, so the smoketest reproduces). The flag travels WITH the candy through
-    // dispense → center → jar and pays off only when it lands a jar's final slot.
-    const everyN = SCORING.multiplier.everyN;
-    if (everyN > 0) for (let i = 0; i < this.queue.length; i++) this.queue[i].special = (i + 1) % everyN === 0;
-    // rack slots: filled from the front of the queue (extra slots stay empty if supply is small)
-    const cap = rackCapacity || (levelData && levelData.rackCapacity) || (DISPENSER.rackCols * DISPENSER.rackRows);
-    this.slots = Array.from({ length: cap }, (_, i) => ({ slotId: i, color: null, special: false }));
+    const packetSize = PACKET.packetSize || 3;
+    // The multiplier now lives on the JAR (see jars.js / SCORING.multiplier), not on candies — so
+    // candies carry no `special` flag. The {special} plumbing is kept (always false) for API stability.
+    this.queue = defs.map((d) => {
+      const color = resolveColor(d.color);
+      const count = d.count != null ? d.count : packetSize;
+      const candies = Array.from({ length: count }, () => ({ special: false }));
+      return { color, count, candies, hasSpecial: false };
+    });
+    const n = (levelData && levelData.packetSlots) || PACKET.slotCount;
+    this.slots = Array.from({ length: n }, (_, i) => ({ slotId: i, packet: null }));
     for (const s of this.slots) this._fill(s.slotId);
   }
 
   slotById(slotId) { return this.slots.find((s) => s.slotId === slotId) || null; }
 
-  // RESPONSIVE re-grid: re-deal the candies still to dispense into a rack of `capacity` slots. Used
-  // when resize() switches the rack grid (e.g. 11×3 ⇄ 6×6) and the cell count changes. Preserves the
-  // remaining candies in order (filled slots first, then the queue), so at game start (nothing
-  // consumed yet) this reproduces the same rack a fresh build of that grid would make. A no-op if the
-  // capacity is unchanged.
-  relayout(capacity) {
-    if (capacity === this.slots.length) return;
-    const remaining = [];
-    for (const s of this.slots) if (s.color) remaining.push({ color: s.color, special: s.special });
-    for (const c of this.queue) remaining.push(c);
-    this.queue = remaining;
-    this.slots = Array.from({ length: capacity }, (_, i) => ({ slotId: i, color: null, special: false }));
-    for (const s of this.slots) this._fill(s.slotId);
-  }
-
-  // Pull the next queued candy into a slot (null if the queue is empty).
+  // Pull the next queued packet into a slot (null if the queue is empty — the tray sits empty).
   _fill(slotId) {
     const slot = this.slotById(slotId);
     if (!slot) return null;
-    const next = this.queue.length ? this.queue.shift() : null;
-    slot.color = next ? next.color : null;
-    slot.special = next ? next.special : false;
-    return slot.color;
+    slot.packet = this.queue.length ? this.queue.shift() : null;
+    return slot.packet;
   }
 
-  // Center the candies in a PARTIAL last row. When the rack has more cells than the supply (e.g. a
-  // 6×6 = 36-cell grid holding 32 candies), the trailing slots are empty, so the last row fills from
-  // the LEFT. Shift its candies into the MIDDLE columns (padding both edges with empty slots) so the
-  // bottom row reads centred. Moves the COLORS (not just x positions), so the front-first rule and
-  // the blocked-candy dimming stay aligned with what's drawn. Only fires when the queue is empty
-  // (a partial row only exists when supply < capacity), so no refill ever lands in a padded edge.
-  centerLastRow(cols) {
-    if (this.queue.length || cols < 1) return;
-    const n = this.slots.length;
-    const rows = Math.ceil(n / cols);
-    if (rows < 1) return;
-    const start = (rows - 1) * cols;
-    const lastRow = this.slots.slice(start);                 // the final row's slots, left→right
-    const items = lastRow.filter((s) => s.color).map((s) => ({ color: s.color, special: s.special }));
-    if (!items.length || items.length >= lastRow.length) return; // empty or already full → nothing to do
-    const offset = Math.floor((lastRow.length - items.length) / 2);
-    if (offset <= 0) return;
-    for (let c = 0; c < lastRow.length; c++) {
-      const k = c - offset;
-      const it = (k >= 0 && k < items.length) ? items[k] : null;
-      this.slots[start + c].color = it ? it.color : null;
-      this.slots[start + c].special = it ? it.special : false;
-    }
-  }
+  // No-ops kept for API compatibility with the old responsive candy RACK (resize() used to re-grid
+  // individual candies). Packet TRAYS are a fixed count (packetSlots) and don't re-deal on resize.
+  relayout() {}
+  centerLastRow() {}
 
-  // TAP: drop the SINGLE candy in `slotIndex`. Returns { color, special } and refills the slot from
-  // the queue, or null if the slot is empty. (`special` = the multiplier candy — see constructor.)
+  // TAP: BURST the whole packet in `slotIndex`. Returns its batch as an array of {color, special}
+  // (length = packet.count), then refills the tray from the queue. null if the slot is empty.
   consume(slotIndex) {
     const slot = this.slots[slotIndex];
-    if (!slot || !slot.color) return null;
-    const out = { color: slot.color, special: !!slot.special };
-    this._fill(slot.slotId); // next queued candy (or null) slides into the slot
-    return out;
+    if (!slot || !slot.packet) return null;
+    const p = slot.packet;
+    const batch = p.candies.map((c) => ({ color: p.color, special: !!c.special }));
+    this._fill(slot.slotId);
+    return batch;
   }
 
-  // Return a candy to the SUPPLY — e.g. it rolled back out of an over-filled tray. Push it to the
-  // FRONT of the queue and, if a rack slot is open, deal it straight back in so the player sees it
-  // return to the dispenser (keeps the level's supply/demand balance intact → still winnable).
+  // Return ONE candy to the SUPPLY — e.g. it rolled back out of an over-filled tray. It becomes a
+  // 1-candy packet at the FRONT of the queue and, if a tray is open, is dealt straight back in so
+  // the player sees it return (keeps the level's supply/demand balance intact → still winnable).
   returnCandy(color, special = false) {
-    this.queue.unshift({ color, special: !!special });
-    const empty = this.slots.find((s) => !s.color);
+    this.queue.unshift({ color, count: 1, candies: [{ special: !!special }], hasSpecial: !!special });
+    const empty = this.slots.find((s) => !s.packet);
     if (empty) this._fill(empty.slotId);
   }
 
-  // Total candies still to be dispensed (sitting in the rack + waiting in the queue).
+  // Every tray's current packet (skipping empty trays).
+  getActivePackets() { return this.slots.map((s) => s.packet).filter(Boolean); }
+
+  // Total candies still to be dispensed (sitting in the trays + waiting in the queue). Drives the
+  // HUD count and the win check.
   remainingCandies() {
-    let n = this.queue.length;
-    for (const s of this.slots) if (s.color) n++;
+    let n = 0;
+    for (const s of this.slots) if (s.packet) n += s.packet.count;
+    for (const p of this.queue) n += p.count;
     return n;
   }
 
-  // True while any candy (in the rack or queued) is still to be dispensed.
+  // True while any candy (in a tray or queued) is still to be dispensed.
   hasRemainingPackets() { return this.remainingCandies() > 0; }
 }

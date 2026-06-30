@@ -8,17 +8,25 @@
 // in that lane becomes the front/active one. Geometry lives in PuzzleGame.resize() /
 // _refreshJarSlots(); per-jar fill + lane state lives on the jar object here.
 
-import { JAR } from '../config.js';
+import { JAR, SCORING } from '../config.js';
+import { hash32 } from './dispenser.js';
 import { resolveColor } from './traySlots.js';
 
 let _jid = 0;
 
 function makeJar(def, i) {
+  // MULTIPLIER JAR: explicitly flagged in the level (def.multiplier) OR a ~1-in-6 SEEDED random pick.
+  // The roll is a deterministic hash of the jar index (NOT Math.random) so the scatter looks random
+  // but reproduces for the smoketest. It wears the ×N glow/badge and pays the multiplier when
+  // COMPLETED (see puzzle.js BOX_CLEAR + renderer._drawOneJar).
+  const M = SCORING.multiplier;
+  const roll = (hash32((i + 1) ^ (M.seed >>> 0)) >>> 0) / 4294967296;   // deterministic [0,1)
   return {
     id: def.id != null ? def.id : i,
     colorKey: resolveColor(def.color),
     shape: def.shape || null,        // descriptive only; the candy shape comes from the color
     capacity: def.capacity || JAR.defaultCapacity,
+    multiplier: !!def.multiplier || (M.chance > 0 && roll < M.chance),
     candies: [],                     // seated candy objects (incl. ones still animating in)
     complete: false,                 // filled to capacity and locked → closing animation begins
     removed: false,                  // closing animation finished → jar sealed + gone (not drawn)

@@ -15,7 +15,7 @@
 
 import { bus, EV } from '../core/events.js';
 import {
-  LEVELS, ACTIVE_LEVEL, COLORS, CANDY_PHYSICS_DEFAULT, HUD, CENTER, JAR, ANIM, DISPENSER, ART, SCORING, POUR,
+  LEVELS, ACTIVE_LEVEL, COLORS, CANDY_PHYSICS_DEFAULT, HUD, CENTER, JAR, ANIM, DISPENSER, ART, SCORING, POUR, PACKET,
 } from '../config.js';
 import { CenterContainerManager } from './center.js';
 import { JarManager } from './jars.js';
@@ -55,6 +55,10 @@ export class PuzzleGame {
     // until they exit the chute into the center; `_releasing` locks input during that fall.
     this.physics = new DispenserPhysics(DISPENSER);
     this.transit = [];
+    // OVERFLOW BUFFER: candies tapped while the tray is FULL pile up at the chute gate (the "black
+    // line") instead of entering the tray. They live here — their own physics objects, gated by
+    // dispenser.js so they can't pass DISPENSER.gate — until _manageGate admits them as the tray frees.
+    this.waiting = [];
     this._releasing = false;
     this._calmMs = 0;        // how long the spilling pile has been moving below the settle speed
     this._fallMs = 0;        // total time since the current spill began (force-settle fallback)
@@ -66,6 +70,8 @@ export class PuzzleGame {
     this._rowStreak = 0;     // consecutive completions ACROSS the front row, lane→lane (the horizontal chain)
     this._lastClearLane = null; // lane of the previous completion (distinguishes vertical vs horizontal)
     this.rejecting = [];     // candies ROLLING BACK OUT of an over-filled tray (cosmetic; re-queued on arrival)
+    this._stuckSince = null; // _time the board first became unwinnable (tray full + nothing fits) — the
+                             // lose screen is held for ANIM.loseRevealMs after this so defeat reads
     this._time = 0;
     this._nextId = 1;
     this.phase = 'playing';
@@ -112,7 +118,11 @@ export class PuzzleGame {
     const chuteExit = dispTop + exitFrac * dispH;
 
     // ---- CENTER holding tray under the chute (centered at cx so the chute feeds it) ----
-    const centerTop = chuteExit - dispH * 0.02;
+    // Place the tray rim just BELOW the chute exit (small positive gap) so the funnel/spout stays
+    // fully visible and candies visibly POUR out of it into the tray. (A negative offset here used to
+    // pull the tray UP over the long old-art spout for a connected look, but widecontainer.png's spout
+    // is short — bottoming at ~0.83 — so any lift made the tray cover the funnel mouth.)
+    const centerTop = chuteExit + dispH * 0.012;
     const centerBot = jarAreaTop - gap;
     let centerH = clamp(centerBot - centerTop, 36, CENTER.maxHeightFrac * s);
     let centerW = centerH * CENTER.aspect;
@@ -131,56 +141,37 @@ export class PuzzleGame {
       right: bL + CENTER.basin.right * centerW,
       floor: bT + CENTER.basin.floor * centerH,
     };
+    // OVERFLOW GATE line (absolute px y): waiting candies pile above it and can't pass into the tray.
+    this.physics.gateY = (DISPENSER.gate && DISPENSER.gate.enabled)
+      ? dispBox.y + DISPENSER.gate.yFrac * dispBox.h
+      : null;
     // ITEM 4: the resting-pile wake threshold (a strike must give a settled candy more than this
     // speed to wake it) + how much it yields on contact. Scaled to the tray so it's screen-independent.
     this.physics.pileWake = CENTER.pile.wakeSpeedFracH * centerH;
     this.physics.pilePush = CENTER.pile.push;
 
-    // ---- CANDY RACK: a grid of individual candies SPREADING down the dispenser cavity ----
-    // The rack runs from the inner rect's top down to DISPENSER.rackBottomFrac of the box — i.e. it
-    // SPREADS into the funnel, not just the rectangular cavity, so the candies fill the dispenser
-    // instead of clustering at the top. Rows below the funnel mouth TAPER: each row is positioned and
-    // sized to the cavity width at its own height (which narrows toward the chute), so every candy
-    // stays inside the visible glass. Front-first / the puzzle are unaffected — only the x/y/r of each
-    // slot change.
+    // ---- TOP PACKET TRAYS: a tidy grid of mono-colour packet trays in the dispenser cavity ----
+    // Each tray (CandyTrayPackets art) is a small BATCH of one colour; tapping one BURSTS its candies
+    // down the funnel into the holding tray. The trays sit inside the inner rectangle (the cavity
+    // ABOVE the funnel mouth) in a `pCols × pRows` grid sized to `packetSlots`; a partial last row is
+    // centred. (No front-first / no responsive re-deal — the tray count is fixed by the level.)
     const IR = colliders.innerRect;
-    const irW = IR.right - IR.left;
-    const rackTop = IR.top;
-    const rackBot = dispBox.y + DISPENSER.rackBottomFrac * dispBox.h;
-    const rackH = rackBot - rackTop;
-    const pkPad = DISPENSER.packetPadFrac * Math.min(irW, rackH);
-    // RESPONSIVE grid: pick whichever candidate makes the most NEAR-SQUARE cells over the rack region
-    // (square cells fill both axes). Tall regions land on 6×6, wide ones on 11×3. Re-grid the rack
-    // slots if the cell count changed (preserves the candies still to dispense).
-    const grids = DISPENSER.rackGrids || [{ cols: DISPENSER.rackCols, rows: DISPENSER.rackRows }];
-    let best = grids[0], bestScore = Infinity;
-    for (const g of grids) {
-      const cw = (irW - 2 * pkPad) / g.cols, ch = (rackH - 2 * pkPad) / g.rows;
-      const score = Math.max(cw / ch, ch / cw); // 1 = perfectly square; lower = squarer = fuller
-      if (score < bestScore) { bestScore = score; best = g; }
-    }
-    this._rackCols = best.cols;
-    this._rackRows = best.rows;
-    this.packets.relayout(best.cols * best.rows);
-    this.packets.centerLastRow(best.cols); // centre a partial last row (e.g. 2 candies in a 6-wide row)
-    const pkCols = Math.max(1, this._rackCols);
-    const pkRows = Math.max(1, this._rackRows);
-    const rowH = (rackH - 2 * pkPad) / pkRows;
-    // cavity [left,right] at a given y: full inner-rect width above the funnel mouth, lerping in to
-    // the chute walls below it (matches the painted funnel slants from the colliders).
-    const cavAt = (y) => {
-      if (y <= colliders.funnelTopY) return [IR.left, IR.right];
-      const t = Math.min(1, (y - colliders.funnelTopY) / Math.max(1, colliders.funnelBotY - colliders.funnelTopY));
-      return [IR.left + (colliders.pathLeft - IR.left) * t, IR.right + (colliders.pathRight - IR.right) * t];
-    };
+    const slotsN = Math.max(1, this.packets.slots.length); // = level.packetSlots
+    const pCols = Math.max(1, Math.min(slotsN, PACKET.columns || 3));
+    const pRows = Math.max(1, Math.ceil(slotsN / pCols));
+    this._rackCols = pCols; this._rackRows = pRows;   // legacy fields (layout only now)
+    const gPad = DISPENSER.packetPadFrac * Math.min(IR.right - IR.left, IR.bottom - IR.top);
+    const gridLeft = IR.left + gPad, gridTop = IR.top + gPad;
+    const cellW = (IR.right - IR.left - 2 * gPad) / pCols;
+    const cellH = (IR.bottom - IR.top - 2 * gPad) / pRows;
+    const tileR = Math.max(8, (Math.min(cellW, cellH) / 2) * (DISPENSER.packetTileFill || 0.94));
     const packets = this.packets.slots.map((_, i) => {
-      const col = i % pkCols, row = Math.floor(i / pkCols);
-      const y = rackTop + pkPad + (row + 0.5) * rowH;
-      const [cl, cr] = cavAt(y);
-      const cw = ((cr - cl) - 2 * pkPad) / pkCols;
-      const x = cl + pkPad + (col + 0.5) * cw;
-      const r = Math.max(6, (Math.min(cw, rowH) / 2) * DISPENSER.rackCandyFill);
-      return { x, y, r };
+      const col = i % pCols, row = Math.floor(i / pCols);
+      const inRow = (row === pRows - 1) ? (slotsN - (pRows - 1) * pCols) : pCols; // candies in this row
+      const off = (pCols - inRow) / 2;                                            // centre a partial row
+      const x = gridLeft + (col + 0.5 + off) * cellW;
+      const y = gridTop + (row + 0.5) * cellH;
+      return { x, y, r: tileR };
     });
 
     // center candy grid metrics
@@ -397,120 +388,124 @@ export class PuzzleGame {
   _centerSettled() { return this.center.candies.every((c) => !c.anim); }
   _allSettled() { return this._allCandies().every((c) => !c.anim); }
 
-  // DISPENSER-STACK RULE: a candy can only be dispensed once the candy directly IN FRONT of it
-  // (the next one toward the chute — one row DOWN in its column) has already been removed. So each
-  // column empties front-first (bottom row up). True ⇒ this candy is still blocked by the one ahead.
-  _dispenseBlocked(i) {
-    const front = i + (this._rackCols || DISPENSER.rackCols); // the cell one row toward the chute, same column
-    const slots = this.packets.slots;
-    return front < slots.length && !!(slots[front] && slots[front].color);
-  }
+  // Packet TRAYS have no front-first stacking (each tray is an independent batch), so a tray is
+  // never "blocked". Kept (always false) for callers/tests that still reference it.
+  _dispenseBlocked() { return false; }
 
-  // Rack slots the player may tap right now: a candy is present AND nothing is in front of it.
+  // Tray slots the player may tap right now: any slot that currently holds a packet.
   tappableSlots() {
     return this.packets.slots
       .map((s, i) => i)
-      .filter((i) => this.packets.slots[i].color && !this._dispenseBlocked(i));
+      .filter((i) => !!this.packets.slots[i].packet);
   }
 
   // ---- INTENTS ---------------------------------------------------------------
-  // Tap a candy in the rack: ONE tap drops ONE candy. It spills out as a physics object at the
-  // tapped cell, tumbles down the dispenser funnel, and PILES in the tray basin; once everything
-  // settles, _depositTray hands the pile to the center container. The player may tap several in a
-  // row (they rain down together) — but only while the tray pipeline (candies falling + already in
-  // the center) stays within the center's capacity, so the holding tray never overflows. A candy
-  // can only be taken once the one IN FRONT of it (toward the chute) is gone (_dispenseBlocked).
+  // Tap a packet TRAY: ONE tap BURSTS its whole batch (PACKET.packetSize candies of one colour).
+  // They spill out as physics objects fanned across the tray, tumble down the dispenser funnel, and
+  // PILE in the holding-tray basin; once everything settles, _depositTray hands the pile to the
+  // center container. A tap is allowed while the tray pipeline (candies falling + already in the
+  // center) is under the overfill ceiling; any candies that don't fit once the burst settles roll
+  // back out to the supply (see _resolveOverfill). There is no front-first stacking.
   onPacketTapped(i) {
     if (this.phase !== 'playing' || !this.layout) return false;
-    // A candy still TUMBLING down the funnel isn't in the tray yet, so the cap is raised by the
-    // overfill margin: you can drop into a brief jumble instead of being hard-blocked at capacity.
-    // Only the hard ceiling (capacity + margin in flight) refuses a tap — with a feedback cue.
-    const ceil = this.center.capacity + (CENTER.overfill.enabled ? CENTER.overfill.margin : 0);
-    if (this.transit.length + this.center.count() >= ceil) {
+    // PIPELINE CEILING: the tray (capacity) PLUS the overflow buffer that piles at the chute gate
+    // (DISPENSER.gate.queueMax). Only when the funnel can hold no more is a tap refused (with a cue).
+    const gateOn = !!(DISPENSER.gate && DISPENSER.gate.enabled);
+    const gateMax = gateOn ? (DISPENSER.gate.queueMax || 0)
+                           : (CENTER.overfill.enabled ? CENTER.overfill.margin : 0);
+    const ceil = this.center.capacity + gateMax;
+    if (this.transit.length + this.waiting.length + this.center.count() >= ceil) {
       const t = this.layout.packets[i];
       if (t) bus.emit(EV.MOVE_INVALID, { x: t.x, y: t.y });
       return false;
     }
-    const slot = this.packets.slots[i];
-    if (!slot || !slot.color) return false;
-    if (this._dispenseBlocked(i)) { // blocked by the candy in front — reject with a cue
-      const t = this.layout.packets[i];
-      bus.emit(EV.MOVE_INVALID, { x: t.x, y: t.y });
-      return false;
-    }
-    const dropped = this.packets.consume(i);
-    if (!dropped) return false;
-    // Bring any candies ALREADY resting in the tray back into the physics sim, so the newly dropped
-    // candy actually COLLIDES with them (piles on top / nudges them) per each candy's material —
-    // instead of falling through and sitting on the floor in front of the pile. They re-settle and
-    // re-deposit together. (No-op on a fresh tap with an empty tray, and while raining several down
-    // the tray is empty until the batch deposits, so this only fires for a drop onto a settled pile.)
-    // ITEM 4: with the soft pile ON we DON'T revive the whole pile — the dropped candy lands on the
-    // settled candies as colliders and ripples only the ones it strikes (see update()/_wakePile).
-    if (!CENTER.pile.enabled) this._reflowCenterIntoTransit();
-    this._calmMs = 0; this._fallMs = 0;
+    const batch = this.packets.consume(i);   // BURST the packet → array of { color, special }
+    if (!batch || !batch.length) return false;
+    const n = batch.length;
+    // Decide admit-vs-wait PER candy up front: a candy is ADMITTED (falls into the tray) only while
+    // the tray still has a free slot; once the tray is full the rest of the burst WAITS at the gate.
+    // Slots committed to the tray = candies resting in it PLUS admitted candies still falling toward
+    // it (transit holds only admitted candies — waiting ones live in this.waiting), so rapid taps
+    // before a deposit still respect the capacity instead of all being admitted.
+    const roomNow = Math.max(0, this.center.capacity - this.center.count() - this.transit.length);
+    let admittedSoFar = 0;
+    const willAdmit = batch.map(() => (admittedSoFar < roomNow ? (++admittedSoFar, true) : false));
+    const anyAdmit = admittedSoFar > 0;
+    // Bring any candies ALREADY resting in the tray back into the physics sim so the admitted candies
+    // COLLIDE with them (pile on top / nudge them) instead of falling through. Only when something is
+    // actually being admitted — a tap that ONLY queues overflow must not disturb the settled tray.
+    // ITEM 4: with the soft pile ON we don't revive the whole pile (see update()/_wakePile).
+    if (anyAdmit && !CENTER.pile.enabled) this._reflowCenterIntoTransit();
+    // An admitted burst LEVELS the tray. The resting pile is now back in the (untilted) physics sim, so
+    // a leftover pour-tilt from a just-finished route would leave the tray art tilted while the candies
+    // (now transit, drawn untilted) hang level — reading as "candies not tilting / floating in air".
+    // Drop any held pour sweep + the tilt so the incoming candies and the tray stay consistent.
+    if (anyAdmit) { this._pourLane = null; this._centerTilt = 0; this._calmMs = 0; this._fallMs = 0; }
     const tile = this.layout.packets[i];
-    const drawR = this._candyDrawR ?? this.physics.r; // DRAW radius (renderer); physics uses cr below
-    const baseCr = this.physics.r;                    // global collision radius (draw × candyFill)
+    for (let k = 0; k < n; k++) {
+      const c = this._spawnTransitCandy(batch[k].color, batch[k].special, tile, k, n);
+      if (willAdmit[k]) { c.admitted = true; this.transit.push(c); }
+      else { c.admitted = false; this.waiting.push(c); }   // piles at the gate (dispenser.js)
+      bus.emit(EV.CANDY_RELEASE, { x: c.x, y: c.y, color: c.colorKey, angle: 0 });
+    }
+    if (anyAdmit) this._releasing = true;
+    return true;
+  }
+
+  // Build ONE transit candy for a packet burst: candy `k` of `n` spilled from tray box `tile`. It
+  // carries the candy's CANDY_PROFILES material (via ph.* from physicsFromProfile) plus deterministic
+  // per-candy cosmetic variety (seeded by the candy id → reproducible, no Math.random), and is fanned
+  // across the tray width so the batch SPREADS instead of stacking on one point.
+  _spawnTransitCandy(col, special, tile, k, n) {
+    const drawR = this._candyDrawR ?? this.physics.r;  // DRAW radius (renderer); physics uses cr below
+    const baseCr = this.physics.r;                     // global collision radius (draw × candyFill)
     const burst = this.physics.burst;
-    const col = dropped.color;
-    const special = dropped.special;   // multiplier candy — travels with this candy to its jar
     const ph = (COLORS[col] && COLORS[col].physics) || CANDY_PHYSICS_DEFAULT;
     const dir = this.physics.colliders.cx - tile.x > 0 ? 1 : -1;
     const id = this._nextId++;
-    // ITEM 1 — DETERMINISTIC per-candy variety. Seed a tiny PRNG from the FIXED game seed XOR this
-    // candy's id, so every candy launches + tumbles a little differently yet 100% reproducibly (no
-    // Math.random anywhere in the sim → the headless smoketest still repeats). Purely cosmetic: it
-    // only perturbs the spawn point, launch vector, spin and per-candy material — never any logic.
     const V = DISPENSER.variety || {};
     const on = V.enabled !== false;
     const rng = makeRng(hash32(((V.seed || 0) >>> 0) ^ Math.imul(id, 0x9e3779b1)));
     const jit = (amt) => (on ? (rng() * 2 - 1) * (amt || 0) : 0);   // symmetric ± amt (0 if disabled)
-    // base launch: a gentle nudge toward the chute centre + downward, then jitter its angle + speed
-    const bvx = dir * burst * 0.12, bvy = burst * 0.25;
+    // HEAVIER candies burst LESS (a light marshmallow pops out further than a dense caramel cube).
+    const massBurst = burst / Math.sqrt(Math.max(0.4, ph.mass || 1));
+    const bvx = dir * massBurst * 0.12, bvy = massBurst * 0.25;
     const ang = Math.atan2(bvy, bvx) + jit(V.angleJitterRad);
     const spd = Math.hypot(bvx, bvy) * (1 + jit(V.speedJitter));
     const posJ = (V.posJitterFrac || 0) * drawR;
-    // ITEM 3 — coarse SHAPE footprint + settle profile (deterministic per colour; shape is fixed).
-    const SH = DISPENSER.shape;
-    const prof = (SH && SH.enabled && SH.profiles[(COLORS[col] && COLORS[col].shape)]) || null;
-    const cr = baseCr * (1 + jit(V.radiusJitter));
-    const c = {
+    // fan the batch out across the tray (deterministic spread by index, plus a little jitter)
+    const frac = n > 1 ? ((k + 0.5) / n - 0.5) : 0;     // -0.5..+0.5 across the batch
+    const spread = frac * tile.r * 2 * (DISPENSER.burstSpreadFrac || 0.5);
+    const cr = baseCr * (ph.crMul || 1) * (1 + jit(V.radiusJitter));
+    return {
       id, colorKey: col, r: drawR, special,
       // per-candy COLLISION radius (item 1 radius jitter) — the sim collides at this; draw stays uniform
       cr,
-      // coarse ellipse half-extents + settle profile from the candy's silhouette (item 3)
-      rx: cr * (prof ? prof.wx : 1), ry: cr * (prof ? prof.hy : 1),
+      // coarse ellipse half-extents + settle profile from the candy's silhouette (profile.visualBounds)
+      rx: cr * (ph.wx || 1), ry: cr * (ph.hy || 1),
       shape: (COLORS[col] && COLORS[col].shape) || 'round',
-      settle: prof ? prof.settle : 'roll', restBase: prof ? prof.base : 0,
-      // each candy carries its REAL material so the funnel sim treats it accordingly: restitution
-      // (bounce), friction (slide/grip), mass (collision momentum + air drag), roll (does it spin),
-      // and the soft-body fields (jiggle/wobble/bump/airDrag) for jelly wobble + cake squash — each
-      // nudged a touch per-candy so a pile of one colour still looks organic.
+      settle: ph.settle || 'roll', restBase: ph.restBase || 0,
+      // each candy carries its REAL material so the funnel sim treats it accordingly (bounce, grip,
+      // mass/momentum, roll, and the soft-body jiggle/wobble/bump/airDrag), nudged a touch per-candy.
       e: clamp(ph.restitution + jit(V.restJitter), 0.05, 0.95),
       fr: ph.friction,
       mass: ph.mass * (1 + jit(V.massJitter)),
       roll: ph.roll, material: ph.material,
       jiggle: ph.jiggle || 0, wobbleFreq: ph.wobbleFreq || 0, wobbleDamp: ph.wobbleDamp || 0,
-      // give EVERY candy a little surface unevenness (added to the material's own bump) so its path
-      // through the funnel scatters instead of tracing the same line each time.
       bump: (ph.bump || 0) + (on ? (V.bumpBase || 0) + Math.abs(jit(V.bumpJitter)) : 0),
       airDrag: ph.airDrag || 1, squashMax: ph.squashMax,
       wAmp: 0, wPhase: 0, wAng: 0,
       angle: 0,
-      spin: (ph.roll ? dir * 5 : 0) + jit(V.spinJitter),
-      // spawn near the tapped cell (jittered within it); gravity + the funnel slants
-      // carry it down into the tray.
-      x: tile.x + jit(posJ),
+      // rollers launch with a roll; ASYMMETRIC candies (high spinAmount — wrapped, lollipop) get an
+      // extra launch tumble so they spin/pivot awkwardly on the way down and as they settle.
+      spin: (ph.roll ? dir * 5 : 0) + dir * (ph.spin || 0) * 7 + jit(V.spinJitter),
+      // spawn fanned across the tray; gravity + the funnel slants carry it down into the holding tray.
+      x: tile.x + spread + jit(posJ),
       y: tile.y + jit(posJ * 0.5),
-      vx: Math.cos(ang) * spd,
+      vx: Math.cos(ang) * spd + frac * massBurst * 0.35,   // edge candies drift outward → a fan
       vy: Math.sin(ang) * spd,
       bornAt: this._time,
     };
-    this.transit.push(c);
-    bus.emit(EV.CANDY_RELEASE, { x: c.x, y: c.y, color: col, angle: 0 });
-    this._releasing = true;
-    return true;
   }
 
   // ITEM 4: a dropped candy struck one or more settled candies hard enough to WAKE them. Pull just
@@ -524,6 +519,7 @@ export class PuzzleGame {
     for (const c of all) {
       if (!c._wake) continue;
       c._wake = false; c.where = 'transit'; c.anim = null; c._started = false;
+      c.admitted = true;   // a tray candy (already past the gate) — never gated
       c.bornAt = this._time; c.spin = c.spin || 0;
       this.transit.push(c);
     }
@@ -557,20 +553,18 @@ export class PuzzleGame {
       c.vx = 0; c.vy = 0; c.spin = 0; c._contact = false;
       c.r = this._candyDrawR ?? c.r;     // refresh draw radius (it may have changed on a resize)
       c.where = 'transit'; c.jar = null; c.anim = null;
+      c.admitted = true;   // a tray candy (already past the gate) — never gated
       c.bornAt = this._time;
       this.transit.push(c);
     }
   }
 
-  // The resting orientation for a settled candy (item 3): snap a cube to its nearest flat face and a
-  // bean/pill onto its long axis so the pile reads as candies LYING naturally; a roller keeps the
-  // angle it tumbled to. (The dynamic wobble/rock already played during the fall.)
+  // The resting orientation for a settled candy: its canonical UPRIGHT angle as drawn in the
+  // spritesheet (`restBase` — 0 for most candies, +90° for the lollipop). The funnel RIGHTING
+  // (dispenser._right) has already eased the live angle to ~this by the time it settles, so freezing
+  // it here is seamless — the player never sees a snap.
   _restAngleFor(c) {
-    const S = DISPENSER.shape;
-    if (!S || !S.enabled || !c.settle || c.settle === 'roll') return c.angle || 0;
-    const half = Math.PI / 2, base = c.restBase || 0;
-    const step = c.settle === 'flat' ? Math.PI : half;
-    return Math.round(((c.angle || 0) - base) / step) * step + base;
+    return c.restBase || 0;
   }
 
   // The spilled candies have settled in the tray -> hand the whole pile to the center container,
@@ -603,6 +597,39 @@ export class PuzzleGame {
       bus.emit(EV.MARBLE_CLINK, { x: c.x, y: c.y, angle: pan, intensity: inten });
     }
     this._releasing = false;
+  }
+
+  // ---- OVERFLOW GATE: admit waiting candies as the tray frees ------------------
+  // Candies that piled at the chute gate (the tray was full when they were tapped) are let in NEAREST
+  // the entrance first, but ONLY while the tray flow is calm (no admitted candy mid-fall, nothing
+  // tweening) so each admitted candy runs the normal settle → deposit → auto-route cycle cleanly. As
+  // many candies as there are free tray slots are released; they tumble through the now-open gate and
+  // pile in the tray exactly like a fresh burst (it reuses the same reflow + transit path).
+  _manageGate() {
+    if (!this.waiting.length) return;
+    if (this._releasing || this.transit.length || !this._allSettled()) return;
+    const free = this.center.capacity - this.center.count();
+    if (free <= 0) return;
+    // NEAREST the tray entrance = lowest in the funnel = the LARGEST y. Admit that many off the front.
+    this.waiting.sort((a, b) => b.y - a.y);
+    const n = Math.min(free, this.waiting.length);
+    if (n <= 0) return;
+    // LEVEL the tray for the incoming candies. The reflowed pile is about to be drawn UNTILTED in the
+    // physics sim, so any held pour-tilt must drop to 0 — otherwise the tray art stays tilted while its
+    // candies hang level (the exact desync onPacketTapped guards against). Keeps tray + candies in sync.
+    this._pourLane = null;
+    this._centerTilt = 0;
+    // bring the resting tray pile back into the sim so the admitted candies pile ON it (as a burst does)
+    if (!CENTER.pile.enabled) this._reflowCenterIntoTransit();
+    for (let k = 0; k < n; k++) {
+      const c = this.waiting.shift();
+      c.admitted = true;
+      c.where = 'transit';
+      c.bornAt = this._time;
+      this.transit.push(c);
+    }
+    this._releasing = true;
+    this._calmMs = 0; this._fallMs = 0;
   }
 
   // Send matching candies from the center into a jar (up to the jar's room).
@@ -905,6 +932,9 @@ export class PuzzleGame {
       this._calmMs = slow ? this._calmMs + ms : 0;
       if (this._traySettled()) this._depositTray();
     }
+    // OVERFLOW: step the candies waiting at the chute gate so they tumble down the funnel and PILE
+    // against it (dispenser.js holds them above DISPENSER.gate); they also re-settle after each admit.
+    if (this.waiting.length) this.physics.step(this.waiting, dt, this._time);
     if (this._releasing && this.transit.length === 0) this._releasing = false;
     this._processAnims();
     // settled center candies keep finishing their landing jiggle / cake squash after deposit
@@ -913,7 +943,8 @@ export class PuzzleGame {
     this._advanceRejecting(dt); // candies rolling BACK OUT of an over-filled tray (item: overfill)
     this._resolveJarCompletions();
     this._autoRoute();
-    this._resolveOverfill();    // auto-route took what FITS; anything still over capacity rolls back out
+    this._manageGate();         // auto-route freed tray room → admit waiting candies (nearest entrance first)
+    this._resolveOverfill();    // (dormant) old roll-back path — no-op while DISPENSER.gate is enabled
     this._checkEnd();
     this._refreshJarSlots(false, dt);   // ease jars toward their slots (lane shift-forward animation)
     // gentle ambient activity: rises while candies are in motion
@@ -927,7 +958,9 @@ export class PuzzleGame {
     // idle BETWEEN pours, so we must NOT reset on the bare busy->idle transition. Re-checked every
     // frame (not one-shot) so it correctly fires after a closing jar is removed. The directional pour
     // sweep shares this exact boundary: lane + tempo release to neutral when the cascade drains.
-    if (this._idle() && !this._anyClosing() && !this._autoRoutePending()) {
+    // Gated on _flowSettled (NOT _idle) so the tray also LEVELS while candies merely WAIT at the gate —
+    // otherwise a held tilt would persist through the overflow waits and desync with the next reflow.
+    if (this._flowSettled() && !this._anyClosing() && !this._autoRoutePending()) {
       this._combo = 0;
       this._pourLane = null;
       this._pourStreak = 0;
@@ -936,8 +969,12 @@ export class PuzzleGame {
     }
   }
 
-  // Fully idle: nothing spilling, nothing tweening (used to gate win/lose).
-  _idle() { return !this._releasing && this.transit.length === 0 && this.rejecting.length === 0 && this._allSettled(); }
+  // The ADMITTED flow is settled: nothing spilling into the tray, nothing tweening. IGNORES candies
+  // WAITING at the gate — so end conditions can be evaluated even with a backlog (a stuck tray is
+  // stuck regardless of the queue), and auto-route can run to drain the tray and open the gate.
+  _flowSettled() { return !this._releasing && this.transit.length === 0 && this.rejecting.length === 0 && this._allSettled(); }
+  // Fully idle: the flow is settled AND no candies are waiting at the gate.
+  _idle() { return this._flowSettled() && this.waiting.length === 0; }
 
   _processAnims() {
     for (const c of this._allCandies()) {
@@ -980,8 +1017,7 @@ export class PuzzleGame {
           this._lastClearLane = jar.lane;
           const comboIndex = Math.min(this._combo, SCORING.combo.maxLink); // 1-based, clamped
           const clutch = this.center.count() / this.center.capacity >= SCORING.clutch.thresholdFrac;
-          const last = jar.candies[jar.capacity - 1];   // candy in the FINAL slot (Phase 2 multiplier)
-          const multiplier = !!(last && last.special);
+          const multiplier = !!jar.multiplier;           // completing a MULTIPLIER JAR pays the ×N (Phase 2)
           const bl = this._jarBox(jar);
           bus.emit(EV.BOX_CLEAR, { x: bl.x, y: bl.y, color: jar.colorKey, comboIndex, clutch, multiplier, pourStreak: this._pourStreak, rowStreak: this._rowStreak });
         }
@@ -994,32 +1030,42 @@ export class PuzzleGame {
   }
 
   _checkEnd() {
-    if (!this._idle()) return;
-    if (!this.packets.hasRemainingPackets() && this.center.isEmpty() && this.jars.allComplete()) {
+    // Gate on the ADMITTED flow being settled (not full idle) so a stuck tray is still caught while
+    // candies wait at the gate; WIN additionally requires the gate queue to be empty (below).
+    if (!this._flowSettled()) return;
+    if (!this.packets.hasRemainingPackets() && this.center.isEmpty() && this.waiting.length === 0
+        && this.jars.allComplete()) {
       this.phase = 'win';
       bus.emit(EV.GAME_WIN, {});
       return;
     }
-    // Stuck (no storage tray to fall back on): the center holds candies no ACTIVE jar will take,
-    // AND there is no way to make progress — either no candies left to dispense, or the center is
-    // full so none can be dropped to complete a jar and advance a lane.
-    if (!this.center.isEmpty()) {
-      const canJar = this.center.colorsPresent().some((col) => this.jars.anyAccepts(col));
-      const canProgress = this.packets.hasRemainingPackets() && this.center.hasRoom();
-      // A jar that has filled but is still playing its closing animation (complete but not yet
-      // removed) is about to advance its lane and expose a new active jar — which may well accept a
-      // color now waiting in the center. Don't call stuck while such a lane advance is pending.
-      const laneAdvancePending = this.jars.jars.some((j) => j.complete && !j.removed);
-      if (!canJar && !canProgress && !laneAdvancePending) {
-        this.phase = 'lose';
-        bus.emit(EV.GAME_LOSE, {});
-      }
+    // STUCK: the player is out of moves when no candy currently in the tray fits any ACTIVE jar AND the
+    // tray is FULL (no room to drop another candy that might complete a jar + advance a lane). While the
+    // tray still has space, or any tray candy matches an active jar, play continues.
+    const trayFull = !this.center.hasRoom();
+    const canJar = this.center.colorsPresent().some((col) => this.jars.anyAccepts(col));
+    // A jar that has filled but is still playing its closing animation (complete but not yet removed)
+    // is about to advance its lane and expose a new active jar that may accept a tray color — so don't
+    // call stuck while such a lane advance is pending.
+    const laneAdvancePending = this.jars.jars.some((j) => j.complete && !j.removed);
+    // Softlock guard: if the tray ISN'T full but there's no supply left to ever fill it (no packets,
+    // none waiting at the gate), the non-full unroutable board can never change — that's stuck too.
+    const noMoreSupply = !this.packets.hasRemainingPackets() && this.waiting.length === 0;
+    const stuck = !this.center.isEmpty() && !canJar && !laneAdvancePending && (trayFull || noMoreSupply);
+    if (!stuck) { this._stuckSince = null; return; }
+    // GRACE PERIOD: hold the dead board for ANIM.loseRevealMs so the player sees + accepts the defeat
+    // before the lose screen appears. The timer cancels (above) the instant the stuck state clears.
+    if (this._stuckSince == null) { this._stuckSince = this._time; return; }
+    if (this._time - this._stuckSince >= (ANIM.loseRevealMs || 0)) {
+      this.phase = 'lose';
+      bus.emit(EV.GAME_LOSE, {});
     }
   }
 
   // candies still needing the player's action (HUD counter + progress). Includes candies
   // currently spilling through the dispenser (transit) so the count never dips mid-release.
   candiesToSort() {
-    return this.packets.remainingCandies() + this.transit.length + this.center.count() + this.rejecting.length;
+    return this.packets.remainingCandies() + this.transit.length + this.waiting.length
+      + this.center.count() + this.rejecting.length;
   }
 }
