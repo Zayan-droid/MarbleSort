@@ -74,17 +74,6 @@ bus.on(EV.BOX_CLEAR, ({ comboIndex = 1, clutch = false, multiplier = false } = {
   audio.clear({ comboIndex, clutch, multiplier });
   haptics.clear({ comboIndex, clutch, multiplier });
 });
-// PEG TICK (item 2) — a candy ticked off a funnel pin. Density-limit the AUDIO so a dense pachinko
-// cascade stays a musical flutter (up to `maxPerFrame` ticks within a `throttleMs` window, then a
-// gap) rather than a buzz; the renderer sparks every hit (cheap) and haptics self-throttles.
-let _pegTimes = [];
-bus.on(EV.PEG_HIT, ({ note01, speed01, pan }) => {
-  const P = AUDIO.peg;
-  const now = (typeof performance !== 'undefined' ? performance.now() : 0);
-  _pegTimes = _pegTimes.filter((t) => now - t < P.throttleMs);
-  if (_pegTimes.length < P.maxPerFrame) { _pegTimes.push(now); audio.peg({ note01, speed01, pan }); }
-  haptics.pegTick(speed01);
-});
 bus.on(EV.GAME_WIN, () => endGame(true));
 bus.on(EV.GAME_LOSE, () => endGame(false));
 

@@ -493,13 +493,13 @@ export class PuzzleGame {
       roll: ph.roll, material: ph.material,
       jiggle: ph.jiggle || 0, wobbleFreq: ph.wobbleFreq || 0, wobbleDamp: ph.wobbleDamp || 0,
       // give EVERY candy a little surface unevenness (added to the material's own bump) so its path
-      // through the funnel + pegs scatters instead of tracing the same line each time.
+      // through the funnel scatters instead of tracing the same line each time.
       bump: (ph.bump || 0) + (on ? (V.bumpBase || 0) + Math.abs(jit(V.bumpJitter)) : 0),
       airDrag: ph.airDrag || 1, squashMax: ph.squashMax,
       wAmp: 0, wPhase: 0, wAng: 0,
       angle: 0,
       spin: (ph.roll ? dir * 5 : 0) + jit(V.spinJitter),
-      // spawn near the tapped cell (jittered within it); gravity + the funnel slants + the PEGS
+      // spawn near the tapped cell (jittered within it); gravity + the funnel slants
       // carry it down into the tray.
       x: tile.x + jit(posJ),
       y: tile.y + jit(posJ * 0.5),
@@ -637,6 +637,7 @@ export class PuzzleGame {
     const mul = this._pourDurMul();
     jar._durMul = mul;
     this._pourCandies(jar, moving, prev, st, mul);
+    this._resettleCenter();   // re-pack the leftovers so none are stranded in mid-air after the pour
     this._reflow(remaining, prev, st, mul);
     return true;
   }
@@ -686,6 +687,7 @@ export class PuzzleGame {
       const mul = this._pourDurMul();   // tempo for THIS jar's whole cycle (route + fill + close)
       jar._durMul = mul;                // the close animation (logic + renderer) reuses it
       this._pourCandies(jar, moving, prev, st, mul);
+      this._resettleCenter();   // re-pack the leftovers so none are stranded in mid-air after the pour
       this._reflow(remaining, prev, st, mul);
       return; // pour one jar at a time
     }
@@ -709,6 +711,51 @@ export class PuzzleGame {
     if (this.center.isEmpty()) return false;
     const present = this.center.colorsPresent();
     return this.jars.activeJars().some((j) => this.jars.roomIn(j) > 0 && present.includes(j.colorKey));
+  }
+
+  // RE-PACK the remaining tray pile after a pour. Otherwise each leftover candy keeps the frozen
+  // restFx/restFy it got from the original funnel pile-up, so a candy that was resting ON a
+  // now-poured neighbour is stranded in mid-air with a gap beneath it — which reads as "physics-less /
+  // candies in the air", and the cosmetic tray-tilt (especially a fast right→left reversal) sweeps
+  // that gap around and makes it obvious. Settle the leftovers with a tiny deterministic
+  // position-based relaxation (gravity pull → floor, circle separation, wall/floor clamp — NO RNG, so
+  // the headless sim still reproduces) and write the new rest spot; _reflow then animates the drop.
+  _resettleCenter() {
+    const cs = this.center.candies;
+    if (!cs.length || !this.layout || !this.physics.basin) return;
+    const L = this.layout.center, B = this.physics.basin;
+    const drawR = this._candyDrawR ?? this.physics.r;
+    const nodes = cs.map((c) => {
+      const p = this.centerRestPos(c);
+      const r = c.cr || drawR;
+      return { c, x: p.x, y: p.y, r, rx: c.rx || r, ry: c.ry || r };
+    });
+    const gstep = (B.floor - (L.y - L.h / 2)) * 0.05;   // gravity drop per iteration (scaled to basin)
+    for (let it = 0; it < 28; it++) {
+      for (const n of nodes) n.y = Math.min(n.y + gstep, B.floor - n.ry);   // gravity → floor
+      // resolve overlaps (Gauss-Seidel); a coincident pair splits horizontally by index (deterministic)
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const a = nodes[i], b = nodes[j];
+          let dx = b.x - a.x, dy = b.y - a.y;
+          const min = a.r + b.r;
+          let d = Math.hypot(dx, dy);
+          if (d >= min) continue;
+          if (d < 1e-6) { dx = -1; dy = 0; d = 1; }     // i<j → push a left, b right
+          const push = (min - d) / 2, nx = dx / d, ny = dy / d;
+          a.x -= nx * push; a.y -= ny * push;
+          b.x += nx * push; b.y += ny * push;
+        }
+      }
+      for (const n of nodes) {     // keep inside the basin walls + floor
+        n.x = clamp(n.x, B.left + n.rx, B.right - n.rx);
+        n.y = Math.min(n.y, B.floor - n.ry);
+      }
+    }
+    for (const n of nodes) {
+      n.c.restFx = (n.x - L.x) / L.w + 0.5;
+      n.c.restFy = (n.y - L.y) / L.h + 0.5;
+    }
   }
 
   // Give center candies that shifted slot a short slide so the grid re-packs smoothly.
@@ -795,20 +842,6 @@ export class PuzzleGame {
     return { angle: this._centerTilt || 0, x: L.x, y: L.y + (CENTER.tilt.pivotYFrac - 0.5) * L.h };
   }
 
-  // Drain the funnel sim's recorded PEG strikes (item 2) into EV.PEG_HIT. The sim stays pure (no event
-  // bus / no Math.random), just RECORDING each pin hit; here we translate it into the normalized
-  // { speed01, pan } the audio (pentatonic music-box tick), haptic and spark layers ride. The hits are
-  // already gated above a speed floor in the sim, so silent grazes never reach here.
-  _emitPegHits() {
-    if (!this.layout) return;
-    const ref = (DISPENSER.pegs && DISPENSER.pegs.speedRef) || 900;
-    const halfW = (this.layout.w || 2) / 2;
-    for (const hit of this.physics.pegHits) {
-      const speed01 = clamp(hit.speed / ref, 0, 1);
-      const pan = clamp((hit.x - this.layout.cx) / halfW, -1, 1);
-      bus.emit(EV.PEG_HIT, { x: hit.x, y: hit.y, note01: hit.note01, speed01, pan, color: hit.colorKey, pegIndex: hit.pegIndex });
-    }
-  }
 
   // OVERFILL ROLLBACK: after a drop has jumbled in and auto-route has taken everything that logically
   // FITS, any candy still over capacity rolls BACK OUT to the rack (a satisfying reject, not a hard
@@ -865,7 +898,6 @@ export class PuzzleGame {
       }
       this.physics.step(this.transit, dt, this._time, resting);
       if (resting && this.center.candies.some((c) => c._wake)) this._wakePile();
-      if (this.physics.pegHits.length) this._emitPegHits();   // item 2: tick off the funnel pins
       const ms = dt * 1000;
       this._fallMs += ms;
       const sp = CENTER.settle.speedFracH * this.layout.center.h;

@@ -237,23 +237,6 @@ export const AUDIO = {
   padNotes: [130.81, 196.0, 261.63],
   warnGain: 0.18,
   warnHz: 320,
-  // PEG TICK — the pachinko/music-box voice fired as a candy ticks off a funnel pin (item 2). A
-  // short, bright, pitched pluck with a bell partial + a tiny noise "pock", routed through the bus
-  // (so it picks up the reverb tail). Pitch follows a PENTATONIC scale by pin height, so a tumbling
-  // cascade always plays a pleasant little run regardless of the (chaotic) order pins are struck.
-  peg: {
-    gain: 0.30,
-    decay: 0.20,             // note length (s) — short, music-box-like
-    partial: 2.0,            // bell overtone ratio
-    partialGain: 0.32,
-    tickGain: 0.16,          // the noise transient (the marble "pock") at the very onset
-    baseHz: 523.25,          // C5 — the LOW end of the pin scale
-    semis: [0, 2, 4, 7, 9, 12, 14, 16, 19, 21], // C major PENTATONIC across two octaves
-    throttleMs: 15,          // min gap between ticks (musical, not a buzz)
-    maxPerFrame: 3,          // cap simultaneous ticks
-    speedToGain: 0.55,       // louder on harder hits (0 = flat)
-    speedToPitchCents: 110,  // a touch brighter on harder hits
-  },
 };
 
 export const HAPTICS = {
@@ -268,10 +251,6 @@ export const HAPTICS = {
   rumbleMinPulse: 6,
   rumbleMaxPulse: 16,
   rumbleSpeedRef: 6.0,
-  // PEG TICK — a very light, throttled pulse as a candy ticks off a funnel pin (item 2). Kept tiny
-  // and rate-limited so a dense pachinko cascade reads as a soft flutter, not a continuous buzz.
-  pegTickMs: 7,
-  pegThrottleMs: 22,
 };
 
 export const RENDER = {
@@ -332,7 +311,9 @@ export const CENTER = {
   // pile lifting and resetting. Bounded by the center capacity (≤6 bodies) so the contacts are nearly
   // free. Toggle `enabled` (false = the old revive-the-whole-pile behaviour).
   pile: {
-    enabled: true,
+    enabled: false,         // DORMANT — out of the requested scope (items 1+2). The proven reflow
+                            // path runs instead; enable + run smoketest (partB/J count invariants)
+                            // before shipping, since this re-routes how a drop onto a pile is counted.
     wakeSpeedFracH: 0.085,  // a resting candy WAKES only if a strike gives it more than this (×box height/s)
     push: 0.45,             // how much a resting candy yields to the dropped candy on contact (0..1)
   },
@@ -343,7 +324,10 @@ export const CENTER = {
   // over capacity ROLLS BACK OUT to the rack with a reject cue — instead of a hard pre-block. Toggle
   // `enabled` (false = the old strict pipeline cap).
   overfill: {
-    enabled: true,
+    enabled: false,       // DORMANT — out of the requested scope (items 1+2). Raising the cap past
+                          // capacity breaks the strict-pipeline regression test (smoketest partC),
+                          // which encodes the shipped "tray never overflows" design. Flip on +
+                          // update partC's expectation together if you want the jumble-then-rollback.
     margin: 2,            // how far the pipeline (falling + in-tray) may exceed capacity before a tap is refused
     riseFrac: 0.55,       // how far a rejected candy floats back up (frac of the tray box height) as it rolls out
     fadeMs: 460,          // roll-back-out animation length (ms)
@@ -589,7 +573,8 @@ export const DISPENSER = {
   // Deterministic per colour (shape is fixed → smoketest still reproduces); the only effect is HOW a
   // pile packs and rests, so piles never form the same way twice. Toggle `enabled`.
   shape: {
-    enabled: true,
+    enabled: false,        // DORMANT — out of the requested scope (items 1+2). Deterministic, but
+                          // unverified here (sandbox down); enable + run smoketest before shipping.
     // half-extent multipliers (× collision radius) per silhouette + a SETTLE profile + rest `base`:
     //   roll = no preferred angle (keeps rolling)   flat = lies on its long axis (180°-symmetric)
     //   snap = snaps to nearest flat face (cube)     wobble = rocks on a point, then tips to an edge
@@ -610,7 +595,7 @@ export const DISPENSER = {
   // candy launches + tumbles a little differently, while the LOGIC stays 100% reproducible (the
   // headless smoketest only checks logical state + "settled", never pixel paths). Purely cosmetic.
   variety: {
-    enabled: false,          // OFF — flip to true to re-enable seeded per-candy cosmetic variety
+    enabled: true,           // ON — seeded per-candy cosmetic variety (item 1)
     seed: 0x5eed,            // fixed game seed → reproducible; change it for a different "shuffle"
     posJitterFrac: 0.55,     // spawn x/y scatter within the tapped cell, as a frac of candy radius
     speedJitter: 0.35,       // ± on the initial spill speed
@@ -621,31 +606,6 @@ export const DISPENSER = {
     radiusJitter: 0.06,      // ± on the COLLISION radius (pile-shape variety; draw size unchanged)
     bumpBase: 0.05,          // give EVERY candy a little surface unevenness (path scatter)…
     bumpJitter: 0.06,        // …plus a per-candy ± on top (added to the material's own bump)
-  },
-  // ---- ITEM 2: FUNNEL PEG FIELD (a Galton / pachinko board in the throat) ---------------------
-  // Pins in the narrowing throat BELOW the rack (so a spilled front candy actually rains through
-  // them) and ABOVE the chute mouth. A candy ticks off each pin — scatter + a pentatonic note +
-  // a spark — then the flanking pins guide it into the chute. Geometry is deterministic; candy
-  // paths vary only through the seeded launch jitter, so the smoketest still reproduces.
-  pegs: {
-    enabled: false,          // OFF — flip to true to re-enable the funnel pegs + ASMR pachinko ticks
-    // rows of pins as fractions of the drawn box; each row auto-spreads `count` pins across the
-    // cavity width at its y (which narrows toward the chute), inset from the slants. Alternate rows
-    // are half-phase offset (true pachinko) so a candy off one pin drops between the next two.
-    rows: [
-      { yFrac: 0.700, count: 3 },
-      { yFrac: 0.742, count: 4 },
-      { yFrac: 0.783, count: 3 },
-    ],
-    radiusFrac: 0.015,       // pin radius as a frac of box width
-    insetFrac: 0.032,        // keep pins this far inside the cavity edges (frac of box width)
-    // collision feel — the pins are RIGID like the walls: bounce uses the candy's OWN restitution,
-    // floored/capped so even a dead jelly still gives a couple of lively ticks.
-    minE: 0.34, maxE: 0.62, bounceMul: 1.15,
-    frictionMul: 0.35,       // light tangential grip (smooth moulded pin)
-    spinKick: 5.0,           // erratic spin a non-roller picks up off a pin (× seeded noise)
-    hitMinSpeed: 26,         // normal approach speed (px/s) below which a graze is silent
-    speedRef: 900,           // approach speed (px/s) mapped to a "full" hit (loudness / brightness)
   },
 };
 

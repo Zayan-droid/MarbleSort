@@ -77,17 +77,6 @@ class Haptics {
     this._safeVibrate(HAPTICS.clearPattern.map((ms) => Math.round(ms * k)));
   }
 
-  // PEG TICK (item 2) — a very light, self-throttled pulse as a candy ticks off a funnel pin. Kept
-  // tiny + rate-limited (pegThrottleMs) so a dense pachinko cascade reads as a soft flutter on the
-  // motor, not a continuous buzz. Slightly longer on a harder strike.
-  pegTick(speed01 = 0.5) {
-    if (!this.enabled) return;
-    const now = this._now();
-    if (now - (this._lastPeg || 0) < HAPTICS.pegThrottleMs) return;
-    this._lastPeg = now;
-    this._safeVibrate(Math.max(3, Math.round(HAPTICS.pegTickMs * (0.7 + 0.6 * clamp01(speed01)))));
-  }
-
   // Soft pulse when a jam is imminent.
   warning() {
     this._safeVibrate(HAPTICS.warningMs);

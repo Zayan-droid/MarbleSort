@@ -227,16 +227,15 @@ const ROUTABLE_IX = LEVELS.push(ROUTABLE_LEVEL) - 1;
   let n = 0;
   while (tapFront(state)) n++;
   if (n !== state.center.capacity) fail(`partC: smart cap should be ${state.center.capacity}, dropped ${n}`);
-  // OVERFILL: a candy still TUMBLING isn't in the tray yet, so further taps are allowed into a brief
-  // overfill margin (not hard pre-blocked); only the hard ceiling (capacity + margin) refuses a tap.
+  // STRICT PIPELINE CAP: once the pipeline (falling + in-tray) hits capacity, further taps are
+  // hard pre-blocked so the tray never overflows (the shipped design; CENTER.overfill is dormant).
   let extra = 0, s;
   while ((s = state.tappableSlots()[0]) !== undefined && state.onPacketTapped(s)) extra++;
-  if (extra !== CENTER.overfill.margin) fail(`partC: overfill should allow +${CENTER.overfill.margin} in flight, got ${extra}`);
-  if (state.transit.length + state.center.count() !== state.center.capacity + CENTER.overfill.margin) fail('partC: pipeline should sit at capacity+margin');
+  if (extra !== 0) fail(`partC: pipeline at capacity should refuse further taps, accepted ${extra}`);
+  if (state.transit.length + state.center.count() !== state.center.capacity) fail('partC: pipeline should sit exactly at capacity');
   settle(state);
-  // the jumble RESOLVES: auto-route takes what fits, the rest rolls back — center never stays over capacity
   if (state.center.count() > state.center.capacity) fail(`partC: center left over capacity (${state.center.count()})`);
-  console.log(`partC: one tap drops one candy that drains; pipeline allows a +${CENTER.overfill.margin} overfill that resolves to <= capacity`);
+  console.log('partC: one tap drops one candy that drains; pipeline strict-caps at capacity (tray never overflows)');
 }
 
 // ---- Part D: the FRONT-FIRST rule — a candy unlocks only once the one in front is dispensed ----

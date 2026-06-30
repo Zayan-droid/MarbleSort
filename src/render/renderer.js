@@ -138,10 +138,6 @@ export class Renderer {
     });
     bus.on(EV.MARBLE_SEAT, ({ x, y, color }) => this._burst(x, y, color, 0.4));
     bus.on(EV.CANDY_RELEASE, ({ x, y, color }) => this._sparkle(x, y, color));
-    // PEG TICK (item 2): a small bright spark flicks off the struck pin — a few candy-coloured motes
-    // plus a couple of warm sparks, scaled by how hard the candy hit. (The pin's own glow flare is
-    // driven by peg._pulse, set in the sim and decayed in _drawPegs.)
-    bus.on(EV.PEG_HIT, ({ x, y, color, speed01 = 0.5 }) => this._pegSpark(x, y, color, speed01));
   }
 
   resize() {
@@ -383,66 +379,6 @@ export class Renderer {
     }
   }
 
-  // PEG TICK spark (item 2): a small flick of candy-coloured + warm-white motes off a struck pin,
-  // scaled by how hard the candy hit. Tiny + short so a dense pachinko rain shimmers, never clutters.
-  _pegSpark(x, y, colorKey, speed01 = 0.5) {
-    const col = COLORS[colorKey] || { light: '#fff', base: '#fff' };
-    const n = 2 + Math.round(4 * speed01);
-    for (let i = 0; i < n; i++) {
-      const a = Math.random() * Math.PI * 2;
-      const sp = (28 + Math.random() * 120) * (0.5 + speed01);
-      this.particles.push({
-        x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 18, age: 0,
-        life: 170 + Math.random() * 150,
-        r: 1 + Math.random() * 1.7, color: (Math.random() < 0.5) ? '#fff3c4' : (col.light || col.base),
-      });
-    }
-  }
-
-  // ITEM 2: draw the funnel PEG FIELD — small glossy pins in the throat. Each pin flares warm when a
-  // candy ticks off it (peg._pulse is set to 1 in the sim on a strike; we decay it here off dt so the
-  // flare is a soft ~0.25s glow). Candies are drawn AFTER this, so they tumble in front of the pins.
-  _drawPegs(ctx, state, dt) {
-    const d = state.layout && state.layout.dispenser;
-    const pegs = d && d.colliders && d.colliders.pegs;
-    if (!pegs || !pegs.length) return;
-    ctx.save();
-    for (const pg of pegs) {
-      const r = pg.r;
-      const pulse = pg._pulse || 0;
-      const lit = pulse > 0.01;
-      if (lit) {
-        // warm flare halo on a strike (additive)
-        ctx.globalCompositeOperation = 'lighter';
-        ctx.globalAlpha = 0.55 * pulse;
-        const rr = r * (3.0 + 2.5 * pulse);
-        const gr = ctx.createRadialGradient(pg.x, pg.y, r * 0.4, pg.x, pg.y, rr);
-        gr.addColorStop(0, 'rgba(255,238,190,1)');
-        gr.addColorStop(1, 'rgba(255,238,190,0)');
-        ctx.fillStyle = gr;
-        ctx.beginPath(); ctx.arc(pg.x, pg.y, rr, 0, Math.PI * 2); ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-        pg._pulse = pulse - dt * 4;   // ~0.25s flare
-      }
-      // the pin: a glossy little dome (radial gradient + a specular highlight + a soft rim)
-      ctx.globalAlpha = 1;
-      const g = ctx.createRadialGradient(pg.x - r * 0.4, pg.y - r * 0.5, r * 0.1, pg.x, pg.y, r * 1.15);
-      g.addColorStop(0, lit ? '#fffef4' : '#f3f5fb');
-      g.addColorStop(0.5, lit ? '#ffe6a0' : '#c7cede');
-      g.addColorStop(1, '#7f8aa3');
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(pg.x, pg.y, r, 0, Math.PI * 2); ctx.fill();
-      ctx.lineWidth = Math.max(0.5, r * 0.14);
-      ctx.strokeStyle = 'rgba(40,48,66,0.45)';
-      ctx.stroke();
-      ctx.globalAlpha = 0.85;
-      ctx.fillStyle = 'rgba(255,255,255,0.9)';
-      ctx.beginPath(); ctx.arc(pg.x - r * 0.34, pg.y - r * 0.42, r * 0.3, 0, Math.PI * 2); ctx.fill();
-      ctx.globalAlpha = 1;
-    }
-    ctx.restore();
-  }
-
   // --- primitives -----------------------------------------------------------
 
   // Trace the body outline of a candy at (x,y) sized to radius r. Each shape is a
@@ -625,7 +561,6 @@ export class Renderer {
     }
 
     this._drawDispenser(ctx, state);
-    this._drawPegs(ctx, state, dt);   // item 2: the funnel pin field (candies tumble in front of it)
     this._drawPacketsPuzzle(ctx, state);
     this._drawCenterBox(ctx, state);
     this._drawJarsPuzzle(ctx, state);
@@ -1375,7 +1310,9 @@ export class Renderer {
       }
       let p = state.candyScreenPos(c);
       let extraAngle = 0;
-      if (tilted && c.where === 'center' && !c.anim) {
+      // candies RESTING or sliding (reflow) inside the tray rotate with it; ones mid-POUR are leaving
+      // over the lip and follow their own world-space arc, so they must NOT be tilt-rotated.
+      if (tilted && c.where === 'center' && !(c.anim && c.anim.kind === 'pour')) {
         const s = Math.sin(tinfo.angle), co = Math.cos(tinfo.angle);
         const dx = p.x - tinfo.x, dy = p.y - tinfo.y;
         p = { x: tinfo.x + dx * co - dy * s, y: tinfo.y + dx * s + dy * co };
@@ -1495,11 +1432,6 @@ export class Renderer {
     ctx.beginPath();
     ctx.moveTo(C.pathLeft, C.exitY); ctx.lineTo(C.pathRight, C.exitY);         // exit line
     ctx.stroke();
-    // funnel PEGS (item 2): stroke each pin's collision circle so the field can be tuned
-    if (C.pegs && C.pegs.length) {
-      ctx.strokeStyle = 'rgba(255,210,90,0.95)';
-      for (const pg of C.pegs) { ctx.beginPath(); ctx.arc(pg.x, pg.y, pg.r, 0, Math.PI * 2); ctx.stroke(); }
-    }
     ctx.restore();
   }
 

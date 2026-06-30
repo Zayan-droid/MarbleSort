@@ -59,47 +59,7 @@ export function computeDispenserColliders(box, cfg) {
     box, innerRect, pathLeft, pathRight, funnelTopY, funnelBotY, exitY,
     cx: (pathLeft + pathRight) / 2,
   };
-  colliders.pegs = computePegs(box, cfg, colliders);
   return colliders;
-}
-
-// Build the funnel PEG FIELD (item 2): a Galton/pachinko board of pins in the narrowing throat.
-// Each configured row spreads `count` pins across the CAVITY WIDTH at its y (the throat narrows
-// toward the chute), inset from the slants, with alternate rows half-phase offset so a candy off
-// one pin tends to drop between the next two. Every pin carries `note01` (0 = low/bottom pin,
-// 1 = high/top pin) for the pentatonic audio mapping. Absolute px; rebuilt on every resize.
-function computePegs(box, cfg, C) {
-  const P = cfg.pegs;
-  if (!P || !P.enabled || !P.rows || !P.rows.length) return [];
-  const { x, w, h } = box;
-  const r = P.radiusFrac * w;
-  const inset = P.insetFrac * w;
-  // cavity [left,right] (absolute px) at a given absolute y: full inner-rect width above the funnel
-  // mouth, lerping in to the chute walls below it (matches the painted slants the candies ride).
-  const cavAt = (yy) => {
-    if (yy <= C.funnelTopY) return [C.innerRect.left, C.innerRect.right];
-    const t = clamp((yy - C.funnelTopY) / Math.max(1, C.funnelBotY - C.funnelTopY), 0, 1);
-    return [lerp(C.innerRect.left, C.pathLeft, t), lerp(C.innerRect.right, C.pathRight, t)];
-  };
-  const pegs = [];
-  const nRows = P.rows.length;
-  P.rows.forEach((row, ri) => {
-    const py = box.y + row.yFrac * h;
-    const [cl, cr] = cavAt(py);
-    const left = cl + inset + r, right = cr - inset - r;
-    const span = Math.max(0, right - left);
-    const n = Math.max(1, row.count | 0);
-    const note01 = nRows > 1 ? 1 - ri / (nRows - 1) : 1; // top row = high note, bottom = low
-    // Successive rows differ in count (e.g. 3 then 2), so their pins naturally interleave like a
-    // pachinko board — a candy off a row-A pin tends to fall into a gap of row B and tick again.
-    for (let i = 0; i < n; i++) {
-      const px = n > 1 ? left + span * (i + 0.5) / n : (left + right) / 2;
-      // a small per-column wobble on the note so adjacent pins in a row arpeggiate slightly
-      const nWobble = n > 1 ? (i / (n - 1) - 0.5) * 0.12 : 0;
-      pegs.push({ x: px, y: py, r, note01: clamp(note01 + nWobble, 0, 1), row: ri, _pulse: 0 });
-    }
-  });
-  return pegs;
 }
 
 export class DispenserPhysics {
@@ -112,9 +72,6 @@ export class DispenserPhysics {
     // The TRAY BASIN below the chute (absolute px: inner walls + floor). Set by PuzzleGame.resize
     // once the center box is known; candies that fall past the chute exit pile against it.
     this.basin = null;
-    // PEG HITS this frame (item 2): the sim stays pure (no event bus) — it just RECORDS each pin
-    // strike here and PuzzleGame drains them after step() to emit EV.PEG_HIT (audio/haptic/spark).
-    this.pegHits = [];
   }
 
   // Bind freshly-computed colliders + scale speeds/sizes to the current dispenser width.
@@ -131,7 +88,6 @@ export class DispenserPhysics {
   // Candies fall through the funnel + chute and then PILE in the tray basin (they are NOT removed
   // here — PuzzleGame watches them settle and hands the whole batch to the center container).
   step(transit, dt, now, resting = null) {
-    this.pegHits.length = 0;   // accumulate this frame's pin strikes; PuzzleGame drains them after
     // ITEM 4: the settled pile (resting center candies) acts as light colliders this step, so a
     // dropped candy lands on it and ripples only the neighbours it strikes. PuzzleGame passes it.
     this._resting = (resting && resting.length) ? resting : null;
@@ -150,7 +106,7 @@ export class DispenserPhysics {
     const C = this.colliders;
     for (const c of transit) {
       const r = c.cr || this.r;     // per-candy COLLISION radius (item 1 radius jitter) — drives
-                                    // wall/floor/peg/pair contact; falls back to the global radius
+                                    // wall/floor/pair contact; falls back to the global radius
       const mass = c.mass || 1;
       // GRAVITY is an ACCELERATION — mass-independent, exactly as in the real world (a heavy gummy
       // and a light hard candy fall together). Mass instead governs momentum in collisions (below).
@@ -171,9 +127,6 @@ export class DispenserPhysics {
         c.vx += sign(C.cx - c.x) * this.burst * 0.6 * h * 8;
         c.vy += this.g * 0.5 * h;
       }
-      // FUNNEL PEGS first (interior pins), THEN the boundary walls/slants/chute/basin, so a candy
-      // a pin deflects into a wall is still wall-corrected in the same sub-step.
-      this._pegs(c, C, r);
       this._constrain(c, C, r, h);
       // airborne (no contact this step): angular momentum bleeds slowly through the air
       if (!c._contact) c.spin *= Math.max(0, 1 - this.cfg.spinAirDamp * h);
@@ -217,47 +170,6 @@ export class DispenserPhysics {
       const push = this.pilePush != null ? this.pilePush : 0.45;
       const ovx = o.vx + j * nx * push, ovy = o.vy + j * ny * push;
       if (Math.hypot(ovx, ovy) > wakeSp) { o.vx = ovx; o.vy = ovy; o._wake = true; }  // local ripple
-    }
-  }
-
-  // ---- candy ↔ funnel PEG (item 2) ----
-  // Treat each pin as a rigid circle. On a real strike: separate the candy out, reflect its
-  // into-pin velocity by its OWN restitution (floored/capped so even a jelly pings a little),
-  // shed a little tangential speed (smooth pin), couple spin (a roller spins up; a slab gets an
-  // erratic kick), squash a soft candy, and RECORD the hit for the ASMR layer (above a speed floor
-  // so silent grazes don't fire). Pure geometry/physics — no events here.
-  _pegs(c, C, r) {
-    const pegs = C.pegs;
-    if (!pegs || !pegs.length || c.y >= C.exitY) return;   // all pins live above the chute exit
-    const P = this.cfg.pegs;
-    for (let i = 0; i < pegs.length; i++) {
-      const pg = pegs[i];
-      const dx = c.x - pg.x, dy = c.y - pg.y;
-      const min = r + pg.r;
-      if (Math.abs(dx) > min || Math.abs(dy) > min) continue;   // cheap reject
-      const d = Math.hypot(dx, dy);
-      if (d >= min || d === 0) continue;
-      const nx = dx / d, ny = dy / d;                  // contact normal: pin → candy
-      c.x = pg.x + nx * min; c.y = pg.y + ny * min;    // pop the candy out of the pin
-      const vn = c.vx * nx + c.vy * ny;                // approach speed (negative = into the pin)
-      if (vn >= 0) continue;
-      const sp = -vn;
-      const e = clamp(Math.max(this._e(c), P.minE) * P.bounceMul, 0, P.maxE);
-      c.vx -= (1 + e) * vn * nx; c.vy -= (1 + e) * vn * ny;     // bounce off the rigid pin
-      // tangential Coulomb-ish loss (smooth pin) + spin coupling
-      const tx = -ny, ty = nx;
-      let vt = c.vx * tx + c.vy * ty;
-      const dvt = Math.min(Math.abs(vt), this._fr(c) * P.frictionMul * (1 + e) * sp);
-      if (vt !== 0) { c.vx -= sign(vt) * dvt * tx; c.vy -= sign(vt) * dvt * ty; }
-      vt = c.vx * tx + c.vy * ty;
-      if (c.roll) { const target = vt / Math.max(1, r); c.spin += (target - c.spin) * this.cfg.rollGrip; }
-      else c.spin += this._noise(c) * P.spinKick;      // a slab/gummy clatters off the pin
-      this._impact(c, sp, nx, ny);                     // squash a soft candy + a little bump scatter
-      c._contact = true;
-      if (sp > P.hitMinSpeed) {
-        pg._pulse = 1;
-        this.pegHits.push({ x: pg.x, y: pg.y, note01: pg.note01, speed: sp, pegIndex: i, colorKey: c.colorKey });
-      }
     }
   }
 
